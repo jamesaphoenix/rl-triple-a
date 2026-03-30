@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TripleA Battle Advisor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    background: #0a0e17;
+    color: #e0e6ed;
+    min-height: 100vh;
+  }
+  .header {
+    background: linear-gradient(135deg, #1a2332 0%, #0d1521 100%);
+    border-bottom: 2px solid #2a4a6b;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .header h1 { font-size: 20px; font-weight: 700; color: #5ba3e6; letter-spacing: 1px; }
+  .header .status { font-size: 13px; color: #7a8a9e; }
+  .header .status .live {
+    display: inline-block; width: 8px; height: 8px; background: #4caf50;
+    border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+
+  .player-banner {
+    background: linear-gradient(135deg, #1a2744 0%, #0f1a2e 100%);
+    border: 1px solid #2a4a6b; border-radius: 10px;
+    padding: 16px 24px; margin-bottom: 16px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .player-name { font-size: 22px; font-weight: 700; }
+  .player-name.russians { color: #e57373; }
+  .player-name.british { color: #ffd54f; }
+  .player-name.americans { color: #64b5f6; }
+  .player-name.chinese { color: #81c784; }
+  .budget-info { font-size: 14px; color: #7a8a9e; margin-top: 4px; }
+  .position-score .value { font-size: 28px; font-weight: 700; color: #5ba3e6; }
+
+  .phase-tabs {
+    display: flex; gap: 8px; margin-bottom: 16px;
+  }
+  .phase-tab {
+    padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 600;
+    cursor: pointer; border: 1px solid #1e2d3d; background: #111827; color: #7a8a9e;
+    text-transform: uppercase; letter-spacing: 1px;
+  }
+  .phase-tab.active { background: #1a3d5c; color: #5ba3e6; border-color: #2a5a8b; }
+  .phase-tab:hover { background: #1a2f44; }
+
+  .phase-content { display: none; }
+  .phase-content.active { display: block; }
+
+  .card {
+    background: #111827; border: 1px solid #1e2d3d; border-radius: 10px;
+    overflow: hidden; margin-bottom: 16px;
+  }
+  .card-header {
+    padding: 12px 16px; font-size: 13px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1.5px; border-bottom: 1px solid #1e2d3d;
+  }
+  .card.purchase .card-header { background: #1a2f1a; color: #4caf50; }
+  .card.attack .card-header { background: #2f1a1a; color: #f44336; }
+  .card.noncombat .card-header { background: #1a1a2f; color: #5ba3e6; }
+  .card.placement .card-header { background: #2f2f1a; color: #ffd54f; }
+  .card-body { padding: 12px 16px; }
+
+  .rec-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 0; border-bottom: 1px solid #1a2230;
+  }
+  .rec-item:last-child { border-bottom: none; }
+  .rec-name { font-size: 15px; font-weight: 500; }
+  .rec-detail { font-size: 12px; color: #7a8a9e; margin-top: 2px; }
+  .rec-score {
+    font-size: 13px; font-weight: 700; padding: 3px 10px;
+    border-radius: 12px; min-width: 50px; text-align: center;
+  }
+  .card.purchase .rec-score { background: #1a3d1a; color: #66bb6a; }
+  .card.attack .rec-score { background: #3d1a1a; color: #ef5350; }
+  .card.noncombat .rec-score { background: #1a1a3d; color: #64b5f6; }
+  .card.placement .rec-score { background: #3d3d1a; color: #ffd54f; }
+
+  .total-cost { padding: 12px 16px; background: #0d1117; font-size: 14px; font-weight: 600; color: #4caf50; border-top: 1px solid #1e2d3d; }
+  .move-arrow { color: #5ba3e6; font-weight: 700; margin: 0 6px; }
+  .empty-state { padding: 24px; text-align: center; color: #4a5568; font-size: 14px; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>TRIPLEA BATTLE ADVISOR</h1>
+  <div class="status"><span class="live"></span><span id="status-text">Connecting...</span></div>
+</div>
+
+<div class="container">
+  <div class="player-banner">
+    <div>
+      <div class="player-name" id="player-name">Waiting for game...</div>
+      <div class="budget-info" id="budget-info">Start a game in TripleA to see recommendations</div>
+    </div>
+    <div class="position-score">
+      <div style="font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #7a8a9e">Position</div>
+      <div class="value" id="position-value">--</div>
+    </div>
+  </div>
+
+  <div class="phase-tabs">
+    <div class="phase-tab active" onclick="showPhase('purchase')">1. Purchase</div>
+    <div class="phase-tab" onclick="showPhase('combat')">2. Combat Move</div>
+    <div class="phase-tab" onclick="showPhase('noncombat')">3. Non-Combat</div>
+    <div class="phase-tab" onclick="showPhase('placement')">4. Placement</div>
+  </div>
+
+  <!-- PHASE 1: PURCHASE -->
+  <div class="phase-content active" id="phase-purchase">
+    <div class="card purchase">
+      <div class="card-header">What to Buy</div>
+      <div class="card-body" id="purchase-list">
+        <div class="empty-state">Waiting for recommendations...</div>
+      </div>
+      <div class="total-cost" id="purchase-total">Total: -- PUs</div>
+    </div>
+  </div>
+
+  <!-- PHASE 2: COMBAT MOVE -->
+  <div class="phase-content" id="phase-combat">
+    <div class="card attack">
+      <div class="card-header">Where to Attack — Move Units Here</div>
+      <div class="card-body" id="attack-list">
+        <div class="empty-state">Waiting for recommendations...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 3: NON-COMBAT MOVE -->
+  <div class="phase-content" id="phase-noncombat">
+    <div class="card noncombat">
+      <div class="card-header">Reinforce These Territories — Pull Units Toward</div>
+      <div class="card-body" id="reinforce-list">
+        <div class="empty-state">Waiting for recommendations...</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PHASE 4: PLACEMENT -->
+  <div class="phase-content" id="phase-placement">
+    <div class="card placement">
+      <div class="card-header">Place Purchased Units</div>
+      <div class="card-body" id="placement-list">
+        <div class="empty-state">Place units at your factories based on purchases above. Prioritize threatened fronts.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const unitEmojis = {
+  infantry: '🔫', artillery: '💣', armour: '🛡️', fighter: '✈️',
+  bomber: '🎯', transport: '🚢', submarine: '🐟', destroyer: '⚓',
+  cruiser: '🚤', carrier: '🛳️', battleship: '⚔️', aaGun: '🔭', factory: '🏭'
+};
+
+const unitCosts = {
+  infantry: 3, artillery: 4, armour: 5, fighter: 10, bomber: 12,
+  transport: 7, submarine: 6, destroyer: 8, cruiser: 12, carrier: 14,
+  battleship: 20, aaGun: 6, factory: 15
+};
+
+function showPhase(phase) {
+  document.querySelectorAll('.phase-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.phase-tab').forEach(el => el.classList.remove('active'));
+  document.getElementById('phase-' + phase).classList.add('active');
+  event.target.classList.add('active');
+}
+
+function updateUI(data) {
+  const recs = data.recommendations;
+  if (!recs) return;
+
+  const budget = recs.budget || 24;
+  const player = recs.player || 'Russians';
+
+  // Player banner
+  document.getElementById('player-name').textContent = player + "'s Turn";
+  document.getElementById('player-name').className = 'player-name ' + player.toLowerCase();
+  document.getElementById('budget-info').textContent =
+    `Budget: ${budget} PUs | Round ${recs.round || '?'} | ${data.last_save || ''}`;
+
+  const val = recs.estimated_value;
+  const valEl = document.getElementById('position-value');
+  valEl.textContent = val > 0 ? '+' + val.toFixed(1) : val.toFixed(1);
+  valEl.style.color = val > 0 ? '#4caf50' : '#f44336';
+
+  document.getElementById('status-text').textContent = `Live | ${data.last_update || ''}`;
+
+  // ── PURCHASE: constrained by actual budget ──
+  const purchaseEl = document.getElementById('purchase-list');
+  if (recs.purchase && recs.purchase.length > 0) {
+    let remaining = budget;
+    let items = [];
+    // Sort by priority, then greedily fill budget
+    const sorted = [...recs.purchase].sort((a, b) => b.priority - a.priority);
+    for (const p of sorted) {
+      const cost = unitCosts[p.unit] || 0;
+      if (cost === 0) continue;
+      const maxAfford = Math.floor(remaining / cost);
+      const count = Math.min(p.count, maxAfford);
+      if (count > 0) {
+        items.push({ ...p, count, totalCost: count * cost });
+        remaining -= count * cost;
+      }
+    }
+    if (items.length > 0) {
+      purchaseEl.innerHTML = items.map(p => `
+        <div class="rec-item">
+          <div>
+            <div class="rec-name">${unitEmojis[p.unit] || ''} ${p.action || (p.count + 'x ' + p.unit)}</div>
+            <div class="rec-detail">${p.cost_each || unitCosts[p.unit]} PUs each</div>
+          </div>
+          <div class="rec-score">${p.total_cost || p.totalCost} PUs</div>
+        </div>
+      `).join('');
+      document.getElementById('purchase-total').textContent =
+        `Total: ${budget - remaining} / ${budget} PUs spent | ${remaining} PUs remaining`;
+    }
+  }
+
+  // ── COMBAT MOVE: territories to attack with priority ──
+  const attackEl = document.getElementById('attack-list');
+  if (recs.attacks && recs.attacks.length > 0) {
+    attackEl.innerHTML = recs.attacks.map((a, i) => {
+      let ordersHtml = '';
+      if (a.orders && a.orders.length > 0) {
+        ordersHtml = a.orders.map(o =>
+          `<div class="rec-detail" style="margin-top:4px; color:#e0a060">↳ ${o.action}</div>`
+        ).join('');
+      } else {
+        ordersHtml = `<div class="rec-detail">Move all adjacent units here</div>`;
+      }
+      return `
+        <div class="rec-item" style="flex-direction:column; align-items:flex-start">
+          <div style="display:flex; justify-content:space-between; width:100%">
+            <div class="rec-name">${i+1}. ${a.action || ('Attack ' + a.territory)}</div>
+            <div class="rec-score">${(a.priority * 100).toFixed(0)}%</div>
+          </div>
+          <div class="rec-detail">Production: ${a.production} IPC</div>
+          ${ordersHtml}
+        </div>`;
+    }).join('');
+  }
+
+  // ── NON-COMBAT: reinforcement targets ──
+  const reinforceEl = document.getElementById('reinforce-list');
+  if (recs.reinforce && recs.reinforce.length > 0) {
+    reinforceEl.innerHTML = recs.reinforce.map((r, i) => {
+      let ordersHtml = '';
+      if (r.orders && r.orders.length > 0) {
+        ordersHtml = r.orders.map(o =>
+          `<div class="rec-detail" style="margin-top:4px; color:#60a0e0">↳ ${o.action}</div>`
+        ).join('');
+      }
+      return `
+        <div class="rec-item" style="flex-direction:column; align-items:flex-start">
+          <div style="display:flex; justify-content:space-between; width:100%">
+            <div class="rec-name">${i+1}. ${r.action || ('Reinforce ' + r.territory)}</div>
+            <div class="rec-score">${(r.priority * 100).toFixed(0)}%</div>
+          </div>
+          ${ordersHtml}
+        </div>`;
+    }).join('');
+  }
+
+  // ── PLACEMENT: based on purchases ──
+  const placementEl = document.getElementById('placement-list');
+  if (recs.placement && recs.placement.length > 0) {
+    placementEl.innerHTML = recs.placement.map(p => `
+      <div class="rec-item">
+        <div>
+          <div class="rec-name">${p.action}</div>
+          <div class="rec-detail">${p.detail || ''}</div>
+        </div>
+      </div>
+    `).join('');
+  } else {
+    placementEl.innerHTML = `
+      <div class="rec-item">
+        <div>
+          <div class="rec-name">Place at most threatened factory</div>
+          <div class="rec-detail">Prioritize factories near the front line.</div>
+        </div>
+      </div>
+    `;
+  }
+}
+
+async function poll() {
+  try {
+    const resp = await fetch('/api/recommendations');
+    const data = await resp.json();
+    updateUI(data);
+  } catch (e) {
+    document.getElementById('status-text').textContent = 'Disconnected';
+  }
+}
+
+setInterval(poll, 2000);
+poll();
+</script>
+</body>
+</html>

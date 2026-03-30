@@ -1,0 +1,46 @@
+# Model checkpoints (too large for git)
+checkpoints_*/
+*.pt
+*.npz
+
+# Training logs
+runs*/
+*.log
+*.jsonl
+
+# Build artifacts
+rust_engine/target/
+rust_engine/*.so
+rust_engine/*.dylib
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# TripleA clone (huge)
+triplea/
+
+# Data files
+data/*.json
+
+# Gradle cache
+.gradle/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+*.swp
+
+# Conda/pip
+*.egg
+dist/
+build/
+
+# Playwright
+.playwright-cli/
+*.class
+Cargo.lock
+*.png
