@@ -116,36 +116,70 @@ def train_selfplay(
     league_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
     league_model.eval()
 
-    # Pre-seed league with foundation model's Axis weights if available
-    foundation_path = "checkpoints_selfplay_v3/foundation_v1_282k_games_93pct.pt"
-    if os.path.exists(foundation_path):
-        try:
-            fnd = torch.load(foundation_path, map_location="cpu", weights_only=False)
-            if "axis" in fnd:
-                league.append(fnd["axis"])
-                log(f"  [League] Pre-seeded with foundation Axis (282k games)")
-            # Also add any league snapshots from foundation
-            for snap in fnd.get("league", []):
-                if "axis" in snap:
-                    league.append(snap["axis"])
-            if len(league) > 1:
-                log(f"  [League] Total pre-seeded snapshots: {len(league)}")
-        except Exception as e:
-            log(f"  [League] Could not load foundation for seeding: {e}")
+    # ── Resume from checkpoint or start fresh ──
+    start_iteration = 0
+    total_steps = 0
+    allied_wins = 0
+    axis_wins = 0
+    total_games = 0
 
-    use_league = len(league) >= 2  # Activate immediately if pre-seeded
+    # Find latest resumable checkpoint
+    resume_path = None
+    if os.path.exists(save_dir):
+        import glob
+        ckpts = sorted(glob.glob(str(save_path / "selfplay_*.pt")),
+                       key=lambda f: os.path.getmtime(f))
+        if ckpts:
+            resume_path = ckpts[-1]
+
+    if resume_path:
+        log(f"  [Resume] Loading checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        allied_model.load_state_dict(ckpt["allied"])
+        axis_model.load_state_dict(ckpt["axis"])
+        if "allied_opt" in ckpt:
+            allied_opt.load_state_dict(ckpt["allied_opt"])
+        if "axis_opt" in ckpt:
+            axis_opt.load_state_dict(ckpt["axis_opt"])
+        start_iteration = ckpt.get("iteration", 0)
+        allied_wins = ckpt.get("allied_wins", 0)
+        axis_wins = ckpt.get("axis_wins", 0)
+        total_games = ckpt.get("total_games", 0)
+        total_steps = ckpt.get("total_steps", 0)
+        # Restore league
+        for snap in ckpt.get("league", []):
+            league.append(snap)
+        log(f"  [Resume] Iter {start_iteration}, {total_games:,} games, "
+            f"Allied {allied_wins/max(total_games,1):.0%}, league: {len(league)} snapshots")
+    else:
+        log(f"  [Fresh] No checkpoint found, starting from scratch")
+        # Pre-seed league with foundation model's Axis weights if available
+        foundation_path = "checkpoints_selfplay_v3/foundation_v1_282k_games_93pct.pt"
+        if os.path.exists(foundation_path):
+            try:
+                fnd = torch.load(foundation_path, map_location="cpu", weights_only=False)
+                if "axis" in fnd:
+                    league.append(fnd["axis"])
+                    log(f"  [League] Pre-seeded with foundation Axis (282k games)")
+                for snap in fnd.get("league", []):
+                    if "axis" in snap:
+                        league.append(snap["axis"])
+                if len(league) > 1:
+                    log(f"  [League] Total pre-seeded snapshots: {len(league)}")
+            except Exception as e:
+                log(f"  [League] Could not load foundation for seeding: {e}")
+
+    use_league = len(league) >= 2
+    allied_log_std = allied_model.log_std
+    axis_log_std = axis_model.log_std
 
     # Reset all engines
     all_obs_flat = np.array(batch_eng.reset_all())
     current_obs = all_obs_flat.reshape(num_envs, obs_size)
 
     start_time = time.time()
-    total_steps = 0
-    allied_wins = 0
-    axis_wins = 0
-    total_games = 0
 
-    for iteration in range(total_iterations):
+    for iteration in range(start_iteration, total_iterations):
         frac = 1.0 - iteration / total_iterations
         for pg in allied_opt.param_groups: pg["lr"] = lr * frac
         for pg in axis_opt.param_groups: pg["lr"] = lr * frac
@@ -386,26 +420,34 @@ def train_selfplay(
                 "league_size": len(league), "league_active": use_league,
             })
 
-        # Save
+        # Save full resumable checkpoint
         if iteration % 100 == 0 and iteration > 0:
             torch.save({
                 "allied": allied_model.state_dict(),
                 "axis": axis_model.state_dict(),
+                "allied_opt": allied_opt.state_dict(),
+                "axis_opt": axis_opt.state_dict(),
                 "iteration": iteration,
                 "allied_wins": allied_wins,
+                "axis_wins": axis_wins,
                 "total_games": total_games,
+                "total_steps": total_steps,
+                "league": [s for s in league],  # all Axis snapshots
             }, save_path / f"selfplay_{iteration}.pt")
+            log(f"  [Checkpoint] Saved iter {iteration} (resumable)")
 
     # Final
     torch.save({
         "allied": allied_model.state_dict(),
         "axis": axis_model.state_dict(),
-        "allied_log_std": allied_log_std.data,
-        "axis_log_std": axis_log_std.data,
+        "allied_opt": allied_opt.state_dict(),
+        "axis_opt": axis_opt.state_dict(),
+        "iteration": total_iterations,
         "allied_wins": allied_wins,
         "axis_wins": axis_wins,
         "total_games": total_games,
-        "league": list(league),
+        "total_steps": total_steps,
+        "league": [s for s in league],
     }, save_path / "selfplay_final.pt")
 
     t = time.time() - start_time
