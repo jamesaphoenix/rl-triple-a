@@ -85,6 +85,7 @@ struct TripleAEngine {
     national_objectives: Vec<NationalObjective>,
     canals: Vec<CanalDef>,
     conquered_this_turn: Vec<bool>,
+    factory_damage: Vec<i32>,  // SBR damage per territory, reduces factory capacity
 
     units: Vec<i32>,
     owner: Vec<i32>,
@@ -253,7 +254,8 @@ impl TripleAEngine {
             round: 1, current_player: 0, done: false, winner: -1,
             pending_purchase: [0; NUM_UNIT_TYPES],
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
-            conquered_this_turn: vec![false; num_t], reset_counter: 0, obs_size,
+            conquered_this_turn: vec![false; num_t], factory_damage: vec![0; num_t],
+            reset_counter: 0, obs_size,
         })
     }
 
@@ -404,6 +406,8 @@ impl TripleAEngine {
         self.done = false;
         self.winner = -1;
         self.pending_purchase = [0; NUM_UNIT_TYPES];
+        self.factory_damage = vec![0; self.num_t];
+        self.conquered_this_turn = vec![false; self.num_t];
         self.reset_counter += 1;
         // FIX #20: varying seeds across resets
         self.rng = Xoshiro256PlusPlus::seed_from_u64(seed.wrapping_add(self.reset_counter * 7919));
@@ -668,6 +672,29 @@ impl TripleAEngine {
                     if self.rng.gen_range(1..=6) <= 4 { hits += 1; }
                 }
                 apply_casualties_ww2v3(&mut dfn, hits);
+            }
+
+            // ── Strategic Bombing Raid ────────────────────────
+            // If enemy territory has a factory and we have bombers, some bomb the factory
+            if !is_sea && atk[BMB] > 0 {
+                let has_enemy_factory = (0..NUM_PLAYERS).any(|ep| {
+                    is_axis(ep) != pa && self.get_unit(t, ep, FAC) > 0
+                });
+                if has_enemy_factory {
+                    // Half the bombers do SBR (simplified — in TripleA player chooses)
+                    let sbr_bombers = atk[BMB] / 2;
+                    if sbr_bombers > 0 {
+                        let max_dmg = self.production[t] * 2;
+                        let mut total_dmg = 0i32;
+                        for _ in 0..sbr_bombers {
+                            total_dmg += self.rng.gen_range(1..=6);
+                        }
+                        let actual = total_dmg.min((max_dmg - self.factory_damage[t]).max(0));
+                        self.factory_damage[t] += actual;
+                        atk[BMB] -= sbr_bombers; // these bombers don't participate in combat
+                        tuv_swing += actual as f32 * 0.5; // approximate value of damage
+                    }
+                }
             }
 
             // ── Move attackers from sources ──────────────────
@@ -946,10 +973,12 @@ impl TripleAEngine {
                 && !self.conquered_this_turn[t] {  // Can't produce from conquered factory
                 // Check if this is an "original" factory (existed at game start for original owner)
                 let is_original = self.init_owner[t] == p as i32;
+                let dmg = self.factory_damage[t];
                 let capacity = if is_original {
-                    100 // effectively unlimited for original factories
+                    // Original factories: still reduced by bombing damage
+                    (self.production[t] - dmg).max(0)
                 } else {
-                    self.production[t] // non-original capped at territory production
+                    (self.production[t] - dmg).max(0)
                 };
                 factories.push((t, capacity));
             }
@@ -1429,7 +1458,8 @@ impl BatchEngine {
                 round: 1, current_player: 0, done: false, winner: -1,
                 pending_purchase: [0; NUM_UNIT_TYPES],
                 rng: Xoshiro256PlusPlus::seed_from_u64(i as u64),
-                conquered_this_turn: vec![false; num_t], reset_counter: 0, obs_size,
+                conquered_this_turn: vec![false; num_t], factory_damage: vec![0; num_t],
+            reset_counter: 0, obs_size,
             });
         }
         Ok(BatchEngine { engines, num_envs, obs_size, num_t })
