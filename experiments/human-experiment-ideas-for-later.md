@@ -3,11 +3,19 @@
 Ideas for future experiments, added by James or auto-research agent.
 Priority: HIGH items should be tried before MEDIUM/LOW.
 
+## URGENT — Known Bugs
+
+- **Land units can enter sea zones without transports** — the Rust engine doesn't enforce transport requirements for amphibious movement. The model learns illegal moves (e.g. "move infantry from Archangel → 4 Sea Zone"). Fix: check for transports in execute_combat when land units target sea zones. Mine TripleA's Java source at `game-app/game-core/src/main/java/games/strategy/triplea/delegate/move/validation/MoveValidator.java` for the exact transport validation logic.
+
+- **Mine TripleA Java source for ALL rules** — the auto-research agent should systematically read the TripleA Java source code in `triplea/` and compare every rule against `rust_engine/src/lib.rs`. Key files to mine: MoveValidator.java, BattleDelegate.java, PlaceDelegate.java, TransportTracker.java, CasualtySelector.java. Fix every discrepancy found.
+
 ## HIGH Priority
 
-- **League training** — Save Axis snapshots every 50 iterations into a pool. Train Allied against a random pick from the pool (50% current Axis, 50% random past Axis). Prevents strategy collapse where both agents find one exploit and keep doing the same thing. This is what AlphaStar/OpenAI Five used. Should be added once we're in the sweet spot (55-70%).
+- **Build TripleA bot (autopilot)** — implement TripleA's `AbstractAi` Java interface so the model plays directly inside TripleA as a player. Java class connects to Python model via localhost socket. No manual HUD needed. Key file: `triplea/game-app/game-core/src/main/java/games/strategy/triplea/ai/AbstractAi.java`. The bot would appear as a player option in TripleA's dropdown menu.
 
-- **Opponent sampling diversity** — Instead of always training against the latest Axis, mix in: (a) the heuristic Axis bot, (b) random past league snapshots, (c) the current Axis. Ratio: 50% current, 30% league, 20% heuristic. Forces Allied to learn robust strategies.
+- **League training** — already implemented, keep improving diversity.
+
+- **Opponent sampling diversity** — already implemented (40/40/20 mix).
 
 ## MEDIUM Priority
 
