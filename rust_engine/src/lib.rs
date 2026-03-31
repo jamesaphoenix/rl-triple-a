@@ -475,10 +475,10 @@ impl TripleAEngine {
         let p = self.current_player;
         let pa = is_axis(p);
         let mut tuv_swing: f32 = 0.0;
-        // Reset conquered tracking for placement restriction
         self.conquered_this_turn = vec![false; self.num_t];
-        // FIX #11: track which territories had ownership changed by blitz this turn
         let mut blitz_captured: Vec<usize> = Vec::new();
+        // FIX #11: prevent units from being used in multiple attacks
+        let mut committed: Vec<bool> = vec![false; self.num_t];
 
         for t in 0..self.num_t {
             if self.is_impassable[t] { continue; }
@@ -502,6 +502,7 @@ impl TripleAEngine {
 
             for n in 0..self.num_t {
                 if !self.adj(t, n) || self.is_impassable[n] { continue; }
+                if committed[n] { continue; } // FIX #11: already used in another attack
                 let mut avail = [0i32; NUM_UNIT_TYPES];
 
                 for u in 0..NUM_UNIT_TYPES {
@@ -672,6 +673,7 @@ impl TripleAEngine {
             // ── Move attackers from sources ──────────────────
             for &(src, ref av) in &sources {
                 for u in 0..NUM_UNIT_TYPES { self.add_unit(src, p, u, -av[u]); }
+                committed[src] = true; // FIX #11: can't use these units again
             }
 
             // ── Pre-combat: remove unescorted transports ─────
@@ -889,6 +891,10 @@ impl TripleAEngine {
                 }
 
                 if !tgt_is_sea {
+                    // FIX #12: intermediate territory n must be friendly for 2-hop NCM
+                    let n_is_friendly = self.owner[n] < 0 || is_axis(self.owner[n] as usize) == pa;
+                    if !n_is_friendly { continue; } // can't move through enemy in non-combat
+
                     for n2 in 0..self.num_t {
                         if n2 == n || n2 == tgt || !self.adj(n, n2) || self.is_impassable[n2] { continue; }
                         if self.is_water[n2] { continue; }
@@ -999,7 +1005,10 @@ impl TripleAEngine {
             if self.player_has_capital(p) {
                 let mut income = 0i32;
                 for t in 0..self.num_t {
-                    if self.owner[t] == p as i32 { income += self.production[t]; }
+                    // FIX #13: water territories don't produce income
+                    if self.owner[t] == p as i32 && !self.is_water[t] {
+                        income += self.production[t];
+                    }
                 }
                 income += self.calc_national_objectives(p);
                 self.pus[p] += income;
