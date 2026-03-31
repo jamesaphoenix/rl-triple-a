@@ -43,6 +43,14 @@ const UNIT_IS_AIR: [bool; NUM_UNIT_TYPES] = [
 const UNIT_CAN_BOMBARD: [bool; NUM_UNIT_TYPES] = [
     false, false, false, false, false, false, false, false, true, false, true, false, false,
 ];
+// Carrier: each carrier holds 2 fighters (standard WW2v3)
+const CARRIER_CAP: i32 = 2;
+// Only fighters can land on carriers (bombers cannot)
+const CAN_LAND_ON_CARRIER: [bool; NUM_UNIT_TYPES] = [
+    false, false, false, true, false, false, false, false, false, false, false, false, false,
+];
+// Movement points per unit type
+const UNIT_MOVEMENT: [i32; NUM_UNIT_TYPES] = [1, 1, 2, 4, 6, 2, 2, 2, 3, 2, 3, 0, 0];
 
 #[inline]
 fn is_axis(player: usize) -> bool {
@@ -156,6 +164,24 @@ impl TripleAEngine {
     }
 
     // FIX #16/19: check Chinese territory restriction for ALL unit movement
+    /// Count available carrier landing slots for fighters in a sea zone.
+    fn carrier_landing_capacity(&self, t: usize, player: usize) -> i32 {
+        let pa = is_axis(player);
+        let mut slots = 0i32;
+        for fp in 0..NUM_PLAYERS {
+            if is_axis(fp) == pa {
+                slots += self.get_unit(t, fp, CAR) * CARRIER_CAP;
+            }
+        }
+        // Subtract fighters already on carriers
+        for fp in 0..NUM_PLAYERS {
+            if is_axis(fp) == pa {
+                slots -= self.get_unit(t, fp, FTR);
+            }
+        }
+        slots.max(0)
+    }
+
     /// Check if a sea unit can pass through a canal between two sea zones.
     /// Returns false if any required land territory is enemy-controlled.
     fn can_pass_canal(&self, from: usize, to: usize, player: usize) -> bool {
@@ -644,14 +670,88 @@ impl TripleAEngine {
                 for u in 0..NUM_UNIT_TYPES { self.add_unit(src, p, u, -av[u]); }
             }
 
+            // ── Pre-combat: remove unescorted transports ─────
+            // If a side has ONLY transports (no combat ships), they die before dice roll
+            let dfn_has_warships = [SUB, DD, CRU, CAR, BB, FTR, BMB].iter().any(|&u| dfn[u] > 0);
+            let atk_has_warships = [SUB, DD, CRU, CAR, BB, FTR, BMB].iter().any(|&u| atk[u] > 0);
+            if !dfn_has_warships && dfn[TRN] > 0 && atk_has_warships {
+                dfn[TRN] = 0; // unescorted defender transports die
+            }
+            if !atk_has_warships && atk[TRN] > 0 && dfn_has_warships {
+                atk[TRN] = 0; // unescorted attacker transports die
+            }
+
+            // ── Sub submerge vs only-air ─────────────────────
+            // If one side is all-air and other has subs, subs submerge (exit combat)
+            let atk_all_air = (atk[FTR] + atk[BMB] > 0)
+                && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| atk[u] == 0);
+            let dfn_all_air = (dfn[FTR] + dfn[BMB] > 0)
+                && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| dfn[u] == 0);
+            let mut submerged_dfn_subs = 0i32;
+            let mut submerged_atk_subs = 0i32;
+            if atk_all_air && dfn[SUB] > 0 {
+                submerged_dfn_subs = dfn[SUB];
+                dfn[SUB] = 0; // subs exit combat
+            }
+            if dfn_all_air && atk[SUB] > 0 {
+                submerged_atk_subs = atk[SUB];
+                atk[SUB] = 0;
+            }
+
             // ── Resolve battle ───────────────────────────────
             let pre_atk_tuv = calc_tuv(&atk);
             let pre_dfn_tuv = calc_tuv(&dfn);
-            let wins = resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng);
+
+            // Check if battle is already over after pre-combat removals
+            let atk_combat: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| atk[i]).sum();
+            let dfn_combat_remaining: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
+            let wins = if atk_combat == 0 || dfn_combat_remaining == 0 {
+                atk_combat > 0 && dfn_combat_remaining == 0
+            } else {
+                resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng)
+            };
+
+            // Restore submerged subs (they survived, just exited combat)
+            if submerged_dfn_subs > 0 {
+                // Find the defending player and restore subs
+                for ep in 0..NUM_PLAYERS {
+                    if is_axis(ep) != pa && self.get_unit(t, ep, SUB) >= 0 {
+                        self.add_unit(t, ep, SUB, submerged_dfn_subs);
+                        break;
+                    }
+                }
+            }
+            if submerged_atk_subs > 0 {
+                atk[SUB] += submerged_atk_subs; // will be placed with winning units
+            }
             tuv_swing += (pre_dfn_tuv - calc_tuv(&dfn)) - (pre_atk_tuv - calc_tuv(&atk));
 
             if wins {
-                for u in 0..NUM_UNIT_TYPES { self.set_unit(t, p, u, atk[u]); }
+                // Place surviving units at conquered territory
+                for u in 0..NUM_UNIT_TYPES {
+                    if atk[u] <= 0 { continue; }
+                    if is_sea && UNIT_IS_AIR[u] {
+                        // Air on sea zones: fighters need carrier capacity, bombers can't stay
+                        if CAN_LAND_ON_CARRIER[u] {
+                            let cap = self.carrier_landing_capacity(t, p);
+                            let land_on_carrier = atk[u].min(cap);
+                            self.set_unit(t, p, u, land_on_carrier);
+                            // Overflow fighters: return to land source
+                            let overflow = atk[u] - land_on_carrier;
+                            if overflow > 0 {
+                                for &(src, _) in &sources {
+                                    if !self.is_water[src] && (self.owner[src] < 0 || is_axis(self.owner[src] as usize) == pa) {
+                                        self.add_unit(src, p, u, overflow);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        // Bombers on sea = lost (can't land on carrier)
+                    } else {
+                        self.set_unit(t, p, u, atk[u]);
+                    }
+                }
                 for ep in 0..NUM_PLAYERS {
                     if is_axis(ep) != pa {
                         for u in 0..NUM_UNIT_TYPES { self.set_unit(t, ep, u, 0); }
@@ -662,20 +762,43 @@ impl TripleAEngine {
                     self.try_capture_capital(t, p, pa);
                 }
             } else {
-                // FIX #12: return surviving land attackers to first valid source
+                // Return surviving units to source territories
                 for u in 0..NUM_UNIT_TYPES {
-                    if atk[u] > 0 && (UNIT_IS_LAND[u] || UNIT_IS_AIR[u]) {
+                    if atk[u] <= 0 { continue; }
+                    if UNIT_IS_LAND[u] || UNIT_IS_AIR[u] {
+                        // Fighters: try land first, then carrier
+                        let can_carrier = CAN_LAND_ON_CARRIER[u];
+                        let mut placed = false;
+                        // Try friendly land source
                         for &(src, _) in &sources {
                             if !self.is_water[src] {
-                                let src_owner = self.owner[src];
-                                if src_owner < 0 || is_axis(src_owner as usize) == pa {
+                                let so = self.owner[src];
+                                if so < 0 || is_axis(so as usize) == pa {
                                     self.add_unit(src, p, u, atk[u]);
                                     atk[u] = 0;
+                                    placed = true;
                                     break;
                                 }
                             }
                         }
-                        // FIX #13: if no landing spot, units are lost
+                        // Fighters: try carrier in adjacent sea zone
+                        if !placed && can_carrier {
+                            for &(src, _) in &sources {
+                                for adj in 0..self.num_t {
+                                    if self.adj(src, adj) && self.is_water[adj]
+                                        && self.carrier_landing_capacity(adj, p) > 0 {
+                                        let cap = self.carrier_landing_capacity(adj, p);
+                                        let land = atk[u].min(cap);
+                                        self.add_unit(adj, p, u, land);
+                                        atk[u] -= land;
+                                        placed = true;
+                                        break;
+                                    }
+                                }
+                                if placed { break; }
+                            }
+                        }
+                        // If still not placed: units are lost (no valid landing)
                     }
                 }
                 if !is_sea && t_owner >= 0 {
