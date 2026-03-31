@@ -452,6 +452,22 @@ impl TripleAEngine {
             return;
         }
         let mut budget = self.pus[p];
+
+        // FIX #35: auto-repair damaged factories (1 PU per point, up to 25% of budget)
+        let repair_budget = budget / 4;
+        let mut repair_spent = 0i32;
+        for t in 0..self.num_t {
+            if repair_spent >= repair_budget { break; }
+            if self.owner[t] != p as i32 { continue; }
+            let dmg = self.factory_damage[t];
+            if dmg > 0 {
+                let repair = dmg.min(repair_budget - repair_spent);
+                self.factory_damage[t] -= repair;
+                repair_spent += repair;
+            }
+        }
+        budget -= repair_spent;
+
         let mut purchase = [0i32; NUM_UNIT_TYPES];
         for i in 0..NUM_UNIT_TYPES.min(action.len()) {
             let count = (action[i] * 20.0).round().max(0.0).min(20.0) as i32;
@@ -718,17 +734,26 @@ impl TripleAEngine {
                 atk[TRN] = 0; // unescorted attacker transports die
             }
 
-            // ── Sub submerge vs only-air ─────────────────────
-            // If one side is all-air and other has subs, subs submerge (exit combat)
+            // ── Sub submerge (WW2v3: SubmersibleSubs=true) ─────
+            let mut submerged_dfn_subs = 0i32;
+            let mut submerged_atk_subs = 0i32;
+
+            // FIX #36: Pre-battle sub submerge — subs can submerge if no enemy DD
+            // Defending subs submerge if attacker has no DD
+            if dfn[SUB] > 0 && atk[DD] == 0 {
+                // Heuristic: defender subs always submerge when they can (optimal defense)
+                submerged_dfn_subs = dfn[SUB];
+                dfn[SUB] = 0;
+            }
+
+            // Sub submerge vs only-air (forced)
             let atk_all_air = (atk[FTR] + atk[BMB] > 0)
                 && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| atk[u] == 0);
             let dfn_all_air = (dfn[FTR] + dfn[BMB] > 0)
                 && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| dfn[u] == 0);
-            let mut submerged_dfn_subs = 0i32;
-            let mut submerged_atk_subs = 0i32;
             if atk_all_air && dfn[SUB] > 0 {
-                submerged_dfn_subs = dfn[SUB];
-                dfn[SUB] = 0; // subs exit combat
+                submerged_dfn_subs += dfn[SUB];
+                dfn[SUB] = 0;
             }
             if dfn_all_air && atk[SUB] > 0 {
                 submerged_atk_subs = atk[SUB];
