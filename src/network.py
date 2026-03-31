@@ -116,28 +116,17 @@ class TerritoryEncoder(nn.Module):
 
 
 class GNNLayer(nn.Module):
-    """Graph neural network layer for territory message passing.
+    """Sparse message-passing GNN layer.
 
-    Each territory aggregates information from its neighbors,
-    weighted by learned attention scores.
+    Instead of dense O(T²) attention, uses pre-computed normalized adjacency
+    for neighbor aggregation. Single matmul per layer, no masking/softmax.
     """
 
-    def __init__(self, embed_dim: int, num_heads: int = 4):
+    def __init__(self, embed_dim: int):
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
-
-        # Message computation
-        self.W_msg = nn.Linear(embed_dim, embed_dim)
-        # Attention over neighbors
-        self.W_q = nn.Linear(embed_dim, embed_dim)
-        self.W_k = nn.Linear(embed_dim, embed_dim)
-        self.W_v = nn.Linear(embed_dim, embed_dim)
-        # Output projection
-        self.W_out = nn.Linear(embed_dim, embed_dim)
+        self.W_self = nn.Linear(embed_dim, embed_dim)
+        self.W_neighbor = nn.Linear(embed_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
-        # Feed-forward
         self.ff = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
             nn.GELU(),
@@ -145,35 +134,15 @@ class GNNLayer(nn.Module):
         )
         self.ff_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x, adj_mask):
+    def forward(self, x, adj_norm):
         """
         x: (batch, num_territories, embed_dim)
-        adj_mask: (num_territories, num_territories) bool — adjacency matrix
+        adj_norm: (T, T) float — row-normalized adjacency with self-loops
         """
-        batch, T, D = x.shape
-        H = self.num_heads
-        Dh = self.head_dim
-
-        # Multi-head attention restricted to adjacent territories
-        q = self.W_q(x).reshape(batch, T, H, Dh).permute(0, 2, 1, 3)  # (B, H, T, Dh)
-        k = self.W_k(x).reshape(batch, T, H, Dh).permute(0, 2, 1, 3)
-        v = self.W_v(x).reshape(batch, T, H, Dh).permute(0, 2, 1, 3)
-
-        # Attention scores
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(Dh)  # (B, H, T, T)
-
-        # Mask: only attend to adjacent territories (+ self)
-        mask = adj_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, T, T)
-        self_mask = torch.eye(T, device=x.device, dtype=torch.bool).unsqueeze(0).unsqueeze(0)
-        full_mask = mask | self_mask  # adjacent + self
-        scores = scores.masked_fill(~full_mask, float('-inf'))
-
-        attn = F.softmax(scores, dim=-1)
-        attn = attn.masked_fill(torch.isnan(attn), 0.0)  # handle isolated nodes
-
-        out = torch.matmul(attn, v)  # (B, H, T, Dh)
-        out = out.permute(0, 2, 1, 3).reshape(batch, T, D)
-        out = self.W_out(out)
+        # Neighbor aggregation: adj_norm @ W_neighbor(x) — one sparse matmul
+        neighbor_msg = torch.matmul(adj_norm, self.W_neighbor(x))  # (B, T, D)
+        self_msg = self.W_self(x)  # (B, T, D)
+        out = F.relu(self_msg + neighbor_msg)
 
         # Skip connection + norm
         x = self.norm(x + out)
@@ -211,25 +180,23 @@ class GlobalAttentionPool(nn.Module):
 
 
 class ActorCriticV3(nn.Module):
-    """Territory-aware architecture with GNN + attention.
+    """Territory-aware architecture with sparse GNN + attention pooling.
 
     Architecture:
     1. TerritoryEncoder: compress raw obs into per-territory embeddings
-    2. GNN layers: propagate information along adjacency graph (3 layers)
-    3. GlobalAttentionPool: attend to relevant territories for each decision type
-    4. Policy heads: purchase (from pooled), attack/reinforce (per-territory scores)
+    2. Sparse GNN layers: message passing along pre-computed adjacency (2 layers)
+    3. GlobalAttentionPool: 3 learned queries attend to territories
+    4. Policy heads: purchase (from pooled), attack/reinforce (per-territory)
     5. Value head: from pooled global representation
-
-    Total params: ~3-5M (vs 8.9M for V2) but much better capacity allocation.
     """
 
     def __init__(
         self,
         obs_size: int,
         action_dim: int,
-        territory_embed_dim: int = 128,
-        num_gnn_layers: int = 3,
-        num_heads: int = 4,
+        territory_embed_dim: int = 64,
+        num_gnn_layers: int = 2,
+        num_heads: int = 2,
         adj_matrix: torch.Tensor = None,
     ):
         super().__init__()
@@ -239,12 +206,15 @@ class ActorCriticV3(nn.Module):
         self.num_territories = NUM_TERRITORIES
         self.num_unit_types = NUM_UNIT_TYPES
 
-        # Store adjacency matrix as buffer (not a parameter)
+        # Pre-compute row-normalized adjacency with self-loops (float buffer)
         if adj_matrix is not None:
-            self.register_buffer('adj_mask', adj_matrix.bool())
+            adj = adj_matrix.float()
+            adj = adj + torch.eye(NUM_TERRITORIES)  # add self-loops
+            adj = adj / adj.sum(dim=1, keepdim=True).clamp(min=1)  # row-normalize
+            self.register_buffer('adj_norm', adj)
         else:
-            # Default: fully connected (will be overridden)
-            self.register_buffer('adj_mask', torch.ones(NUM_TERRITORIES, NUM_TERRITORIES, dtype=torch.bool))
+            adj = torch.eye(NUM_TERRITORIES)
+            self.register_buffer('adj_norm', adj)
 
         # 1. Territory encoder
         self.territory_encoder = TerritoryEncoder(territory_embed_dim)
@@ -258,9 +228,9 @@ class ActorCriticV3(nn.Module):
             nn.ReLU(),
         )
 
-        # 3. GNN layers with skip connections
+        # 3. Sparse GNN layers
         self.gnn_layers = nn.ModuleList([
-            GNNLayer(territory_embed_dim, num_heads) for _ in range(num_gnn_layers)
+            GNNLayer(territory_embed_dim) for _ in range(num_gnn_layers)
         ])
 
         # 4. Global attention pooling
@@ -271,33 +241,31 @@ class ActorCriticV3(nn.Module):
 
         # Purchase head (from pooled global representation)
         self.purchase_head = nn.Sequential(
-            nn.Linear(pooled_dim, 128),
+            nn.Linear(pooled_dim, 64),
             nn.ReLU(),
-            nn.Linear(128, NUM_UNIT_TYPES),
+            nn.Linear(64, NUM_UNIT_TYPES),
             nn.Sigmoid(),
         )
 
         # Attack head (per-territory scores from territory embeddings)
         self.attack_head = nn.Sequential(
-            nn.Linear(territory_embed_dim, 64),
+            nn.Linear(territory_embed_dim, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
             nn.Sigmoid(),
         )
 
         # Reinforce head (per-territory scores)
         self.reinforce_head = nn.Sequential(
-            nn.Linear(territory_embed_dim, 64),
+            nn.Linear(territory_embed_dim, 32),
             nn.ReLU(),
-            nn.Linear(64, 1),
+            nn.Linear(32, 1),
             nn.Sigmoid(),
         )
 
         # 6. Value head
         self.value_head = nn.Sequential(
-            nn.Linear(pooled_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 64),
+            nn.Linear(pooled_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )
@@ -317,9 +285,9 @@ class ActorCriticV3(nn.Module):
         # Add global context to each territory embedding
         terr_embed = terr_embed + global_embed.unsqueeze(1)
 
-        # GNN message passing
+        # Sparse GNN message passing
         for gnn in self.gnn_layers:
-            terr_embed = gnn(terr_embed, self.adj_mask)
+            terr_embed = gnn(terr_embed, self.adj_norm)
 
         # Global attention pooling
         pooled = self.global_pool(terr_embed)  # (B, 3*D)

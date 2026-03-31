@@ -4,11 +4,15 @@
 All 16 CPU cores run game simulations in parallel via Rayon.
 GPU handles all neural net inference in single batched forward passes.
 Zero Python-level loops over environments.
+
+Pipeline optimization: PPO training runs in a background thread,
+overlapping GPU gradient computation with next rollout's Rust env stepping.
 """
 
 import sys
 import time
 import copy
+import threading
 from pathlib import Path
 from collections import deque
 
@@ -76,6 +80,13 @@ def train_selfplay(
 
     # Create batch engine — all envs in one Rust object, parallel via Rayon
     arrays = export_map_arrays()
+    # Axis bid: give Axis extra starting PUs (competitive balance)
+    arrays["initial_pus"] = arrays["initial_pus"].copy()
+    arrays["initial_pus"][0] += 20  # Japanese: +20
+    arrays["initial_pus"][2] += 28  # Germans: +28
+    arrays["initial_pus"][4] += 16  # Italians: +16 (was +12, now +4 more)
+    print(f"Axis bid applied (+64 total): Japanese {arrays['initial_pus'][0]}, "
+          f"Germans {arrays['initial_pus'][2]}, Italians {arrays['initial_pus'][4]}")
     batch_eng = BatchEngine(
         num_envs,
         arrays["adjacency"], arrays["is_water"], arrays["is_impassable"],
@@ -97,13 +108,14 @@ def train_selfplay(
     print(f"Envs: {num_envs} | Obs: {obs_size} | Act: {action_dim}")
     print(f"Steps/iter: {steps_per_iter} | Batch: {batch_size}")
     print(f"Rayon parallel across all CPU cores")
+    print(f"Async pipeline: PPO training overlaps with next rollout")
 
-    # Two networks — V3 architecture with GNN + attention
-    adj_matrix = torch.from_numpy(arrays["adjacency"]).bool()
-    allied_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
-                                 num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
-    axis_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
-                               num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
+    # Two networks — V3 sparse GNN architecture
+    adj_matrix = torch.from_numpy(arrays["adjacency"]).float()
+    allied_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=64,
+                                 num_gnn_layers=2, num_heads=2, adj_matrix=adj_matrix).to(device)
+    axis_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=64,
+                               num_gnn_layers=2, num_heads=2, adj_matrix=adj_matrix).to(device)
     # FIX #10: include ALL parameters (including model.log_std) in optimizer
     allied_opt = optim.Adam(allied_model.parameters(), lr=lr, eps=1e-5)
     axis_opt = optim.Adam(axis_model.parameters(), lr=lr, eps=1e-5)
@@ -115,9 +127,8 @@ def train_selfplay(
     print(f"Params/agent: {params:,}")
 
     league = deque(maxlen=20)  # Store up to 20 past Axis snapshots
-    league_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
-                                 num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
-    league_model.eval()
+    league_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=64,
+                                 num_gnn_layers=2, num_heads=2, adj_matrix=adj_matrix).to(device)
 
     # ── Resume from checkpoint or start fresh ──
     start_iteration = 0
@@ -197,14 +208,54 @@ def train_selfplay(
     all_obs_flat = np.array(batch_eng.reset_all())
     current_obs = all_obs_flat.reshape(num_envs, obs_size)
 
+    # === PPO update function (runs in background thread) ===
+    def ppo_update(model, opt, log_std, obs, acts, old_lp, advs, rets, epochs_override=None, ent_coeff=0.02):
+        N = obs.shape[0]
+        if N == 0: return 0.0
+        n_epochs = epochs_override or num_epochs
+        o = torch.from_numpy(obs).to(device)
+        a = torch.from_numpy(acts).to(device)
+        ol = torch.from_numpy(old_lp).to(device)
+        ad = torch.from_numpy(advs).to(device)
+        ad = (ad - ad.mean()) / (ad.std() + 1e-8)
+        rt = torch.from_numpy(rets).to(device)
+
+        model.train()
+        loss_val = 0.0
+        for _ in range(n_epochs):
+            perm = torch.randperm(N, device=device)
+            for s in range(0, N, batch_size):
+                idx = perm[s:s+batch_size]
+                am, v = model.forward(o[idx])
+                std = torch.exp(log_std).expand_as(am)
+                lp = (-0.5 * ((a[idx] - am) / std)**2 - torch.log(std) - 0.9189).sum(-1)
+                ent = (0.5 * torch.log(2*3.14159*2.71828 * std**2)).sum(-1).mean()
+                ratio = torch.exp(lp - ol[idx])
+                pg = -torch.min(ratio * ad[idx],
+                               torch.clamp(ratio, 0.8, 1.2) * ad[idx]).mean()
+                vl = nn.MSELoss()(v.squeeze(-1), rt[idx])
+                loss = pg + 0.5*vl - ent_coeff*ent
+                opt.zero_grad()
+                loss.backward()
+                # FIX #10: clip ALL params including log_std
+                nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                opt.step()
+                loss_val = pg.item()
+        return loss_val
+
     start_time = time.time()
+
+    # Async PPO state
+    ppo_thread = None
+    ppo_result = [0.0, 0.0]  # [al_pg, ax_pg]
+    al_pg, ax_pg = 0.0, 0.0
 
     for iteration in range(start_iteration, total_iterations):
         frac = 1.0 - iteration / total_iterations
         for pg in allied_opt.param_groups: pg["lr"] = lr * frac
         for pg in axis_opt.param_groups: pg["lr"] = lr * frac
 
-        # Rollout storage
+        # Rollout storage (fresh each iteration — safe for concurrent PPO)
         all_obs_buf = np.zeros((steps_per_iter, num_envs, obs_size), dtype=np.float32)
         all_act_buf = np.zeros((steps_per_iter, num_envs, action_dim), dtype=np.float32)
         all_logp_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
@@ -213,17 +264,14 @@ def train_selfplay(
         all_done_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
         all_is_axis_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
 
-        allied_model.eval()
-        axis_model.eval()
-
         # Timing instrumentation
         t_gpu = 0.0
         t_rust = 0.0
         t_numpy = 0.0
 
+        # === ROLLOUT PHASE ===
+        # (overlaps with previous iteration's PPO training via threading)
         for step in range(steps_per_iter):
-            t0 = time.time()
-
             is_axis_flags = np.array(batch_eng.get_is_axis())
             axis_mask = is_axis_flags.astype(bool)
 
@@ -253,24 +301,17 @@ def train_selfplay(
                     league_ax_dist = torch.distributions.Normal(league_ax_mean, league_ax_std)
                     league_ax_actions = league_ax_dist.sample().clamp(0.0, 1.0)
 
-                    # Random noise actions (20% of Axis envs)
+                    # Vectorized opponent assignment (no Python loop)
+                    # 40% current Axis, 40% league, 20% random
+                    rand_vals = torch.rand(num_envs, device=device)
+                    axis_mask_t = torch.from_numpy(axis_mask).to(device)
+                    use_league_mask = axis_mask_t & (rand_vals >= 0.40) & (rand_vals < 0.80)
+                    use_random_mask = axis_mask_t & (rand_vals >= 0.80)
                     random_actions = torch.rand_like(ax_actions)
+                    ax_actions[use_league_mask] = league_ax_actions[use_league_mask]
+                    ax_actions[use_random_mask] = random_actions[use_random_mask]
 
-                    # Per-env opponent assignment:
-                    # 40% current Axis, 40% league snapshot, 20% random
-                    for i in range(num_envs):
-                        if not axis_mask[i]:
-                            continue
-                        r = np.random.random()
-                        if r < 0.40:
-                            pass  # keep current axis
-                        elif r < 0.80:
-                            ax_actions[i] = league_ax_actions[i]  # league opponent
-                        else:
-                            ax_actions[i] = random_actions[i]  # random noise
-
-            if device.type == 'mps':
-                torch.mps.synchronize()
+            # No explicit mps.synchronize() — .cpu() below handles it implicitly
             t2 = time.time()
             t_gpu += t2 - t1
 
@@ -290,7 +331,7 @@ def train_selfplay(
             t3 = time.time()
             t_numpy += t3 - t2
 
-            # Rayon-parallel game step
+            # Rayon-parallel game step (releases GIL — runs concurrently with GPU)
             result = batch_eng.step_all(purchases, attack_scores, reinforce_scores)
 
             t4 = time.time()
@@ -301,12 +342,13 @@ def train_selfplay(
             winners = np.array(result["winners"])
             new_obs = np.array(result["obs"]).reshape(num_envs, obs_size)
 
-            # Track episodes
-            for i in range(num_envs):
-                if dones[i] > 0.5:
-                    total_games += 1
-                    if winners[i] == 0: axis_wins += 1
-                    elif winners[i] == 1: allied_wins += 1
+            # Vectorized episode tracking
+            done_mask = dones > 0.5
+            n_done = done_mask.sum()
+            if n_done > 0:
+                total_games += int(n_done)
+                axis_wins += int((winners[done_mask] == 0).sum())
+                allied_wins += int((winners[done_mask] == 1).sum())
 
             # Store
             all_obs_buf[step] = current_obs
@@ -320,78 +362,13 @@ def train_selfplay(
             current_obs = new_obs
             total_steps += num_envs
 
-        # === Compute GAE ===
-        # FIX #8: bootstrap value from final observation
-        with torch.no_grad():
-            obs_t = torch.from_numpy(current_obs).to(device)
-            is_axis_now = np.array(batch_eng.get_is_axis()).astype(bool)
-            _, al_boot = allied_model.forward(obs_t)
-            _, ax_boot = axis_model.forward(obs_t)
-            boot_vals = np.where(is_axis_now,
-                                 ax_boot.squeeze(-1).cpu().numpy(),
-                                 al_boot.squeeze(-1).cpu().numpy())
-        advantages, returns = compute_gae_batch(all_rew_buf, all_val_buf, all_done_buf, boot_vals)
+        # === WAIT FOR PREVIOUS PPO (if still running) ===
+        if ppo_thread is not None:
+            ppo_thread.join()
+            al_pg, ax_pg = ppo_result[0], ppo_result[1]
 
-        # Split data by side
-        al_mask = all_is_axis_buf < 0.5  # (steps, envs) bool
-        ax_mask = ~al_mask
-
-        def extract_side(mask):
-            m = mask.reshape(-1)
-            return (
-                all_obs_buf.reshape(-1, obs_size)[m],
-                all_act_buf.reshape(-1, action_dim)[m],
-                all_logp_buf.reshape(-1)[m],
-                advantages.reshape(-1)[m],
-                returns.reshape(-1)[m],
-            )
-
-        al_o, al_a, al_l, al_adv, al_ret = extract_side(al_mask)
-        ax_o, ax_a, ax_l, ax_adv, ax_ret = extract_side(ax_mask)
-
-        # === PPO Updates ===
-        def ppo_update(model, opt, log_std, obs, acts, old_lp, advs, rets, epochs_override=None, ent_coeff=0.02):
-            N = obs.shape[0]
-            if N == 0: return 0.0
-            n_epochs = epochs_override or num_epochs
-            o = torch.from_numpy(obs).to(device)
-            a = torch.from_numpy(acts).to(device)
-            ol = torch.from_numpy(old_lp).to(device)
-            ad = torch.from_numpy(advs).to(device)
-            ad = (ad - ad.mean()) / (ad.std() + 1e-8)
-            rt = torch.from_numpy(rets).to(device)
-
-            model.train()
-            loss_val = 0.0
-            for _ in range(n_epochs):
-                perm = torch.randperm(N, device=device)
-                for s in range(0, N, batch_size):
-                    idx = perm[s:s+batch_size]
-                    am, v = model.forward(o[idx])
-                    std = torch.exp(log_std).expand_as(am)
-                    lp = (-0.5 * ((a[idx] - am) / std)**2 - torch.log(std) - 0.9189).sum(-1)
-                    ent = (0.5 * torch.log(2*3.14159*2.71828 * std**2)).sum(-1).mean()
-                    ratio = torch.exp(lp - ol[idx])
-                    pg = -torch.min(ratio * ad[idx],
-                                   torch.clamp(ratio, 0.8, 1.2) * ad[idx]).mean()
-                    vl = nn.MSELoss()(v.squeeze(-1), rt[idx])
-                    loss = pg + 0.5*vl - ent_coeff*ent
-                    opt.zero_grad()
-                    loss.backward()
-                    # FIX #10: clip ALL params including log_std
-                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    opt.step()
-                    loss_val = pg.item()
-            return loss_val
-
-        al_pg = ppo_update(allied_model, allied_opt, allied_log_std,
-                           al_o, al_a, al_l, al_adv, al_ret)
-        # Axis gets 3x more PPO epochs + higher entropy for diverse strategies
-        ax_pg = ppo_update(axis_model, axis_opt, axis_log_std,
-                           ax_o, ax_a, ax_l, ax_adv, ax_ret,
-                           epochs_override=num_epochs * 5, ent_coeff=0.05)
-
-        # League snapshot — save Axis weights every 50 iterations
+        # === League snapshot + Logging + Checkpoint ===
+        # (must come after PPO join — needs updated weights)
         if iteration > 0 and iteration % 50 == 0:
             league.append(copy.deepcopy(axis_model.state_dict()))
             log(f"  [League] Saved Axis snapshot #{len(league)} (iter {iteration})")
@@ -400,13 +377,12 @@ def train_selfplay(
             if len(league) >= 2 and not use_league:
                 use_league = True
                 log(f"  [League] ACTIVATED — Allied now faces diverse opponents")
-                log(f"  [League] Mix: 50% current Axis, 30% past snapshots, 20% random")
+                log(f"  [League] Mix: 40% current Axis, 40% past snapshots, 20% random")
 
             # Load a random league snapshot into the league_model
             if len(league) >= 2:
                 random_snapshot = league[np.random.randint(0, len(league))]
                 league_model.load_state_dict(random_snapshot)
-                league_model.eval()
 
         # Logging
         if iteration % 5 == 0:
@@ -416,7 +392,7 @@ def train_selfplay(
             eta = f"{rem/60:.1f}m" if rem < 3600 else f"{rem/3600:.1f}h"
             wr = allied_wins / max(total_games, 1)
 
-            # Timing breakdown
+            # Timing breakdown (rollout phase only)
             t_total_iter = t_gpu + t_rust + t_numpy
             gpu_pct = t_gpu / max(t_total_iter, 1e-6) * 100
             rust_pct = t_rust / max(t_total_iter, 1e-6) * 100
@@ -440,7 +416,7 @@ def train_selfplay(
                 "league_size": len(league), "league_active": use_league,
             })
 
-        # Save full resumable checkpoint
+        # Save full resumable checkpoint (after PPO is done)
         if iteration % 100 == 0 and iteration > 0:
             torch.save({
                 "allied": allied_model.state_dict(),
@@ -455,6 +431,54 @@ def train_selfplay(
                 "league": [s for s in league],  # all Axis snapshots
             }, save_path / f"selfplay_{iteration}.pt")
             log(f"  [Checkpoint] Saved iter {iteration} (resumable)")
+
+        # === Compute GAE ===
+        # FIX #8: bootstrap value from final observation
+        with torch.no_grad():
+            obs_t = torch.from_numpy(current_obs).to(device)
+            is_axis_now = np.array(batch_eng.get_is_axis()).astype(bool)
+            _, al_boot = allied_model.forward(obs_t)
+            _, ax_boot = axis_model.forward(obs_t)
+            boot_vals = np.where(is_axis_now,
+                                 ax_boot.squeeze(-1).cpu().numpy(),
+                                 al_boot.squeeze(-1).cpu().numpy())
+        advantages, returns = compute_gae_batch(all_rew_buf, all_val_buf, all_done_buf, boot_vals)
+
+        # Split data by side
+        al_mask = all_is_axis_buf < 0.5  # (steps, envs) bool
+        ax_mask_buf = ~al_mask
+
+        def extract_side(mask):
+            m = mask.reshape(-1)
+            return (
+                all_obs_buf.reshape(-1, obs_size)[m],
+                all_act_buf.reshape(-1, action_dim)[m],
+                all_logp_buf.reshape(-1)[m],
+                advantages.reshape(-1)[m],
+                returns.reshape(-1)[m],
+            )
+
+        al_o, al_a, al_l, al_adv, al_ret = extract_side(al_mask)
+        ax_o, ax_a, ax_l, ax_adv, ax_ret = extract_side(ax_mask_buf)
+
+        # === START PPO IN BACKGROUND THREAD ===
+        # Next iteration's rollout (Rust CPU work) overlaps with this PPO (GPU work)
+        # Both PyTorch GPU ops and Rust (pyo3) release the GIL → true parallelism
+        ppo_result = [0.0, 0.0]
+
+        def run_ppo():
+            ppo_result[0] = ppo_update(allied_model, allied_opt, allied_log_std,
+                                       al_o, al_a, al_l, al_adv, al_ret)
+            ppo_result[1] = ppo_update(axis_model, axis_opt, axis_log_std,
+                                       ax_o, ax_a, ax_l, ax_adv, ax_ret,
+                                       epochs_override=num_epochs * 5, ent_coeff=0.05)
+
+        ppo_thread = threading.Thread(target=run_ppo, daemon=True)
+        ppo_thread.start()
+
+    # Wait for final PPO
+    if ppo_thread is not None:
+        ppo_thread.join()
 
     # Final
     torch.save({
@@ -490,6 +514,7 @@ if __name__ == "__main__":
     print("  RL TripleA — Self-Play V3 (Rayon Parallel + MPS GPU)")
     print(f"  {a.num_envs} envs on 16 CPU cores (Rayon) + MPS GPU neural net")
     print(f"  Full mechanics: naval, AA, subs, BBs, bombing, capitals")
+    print(f"  Async pipeline: PPO overlaps with rollout collection")
     print("=" * 70)
 
     train_selfplay(

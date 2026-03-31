@@ -1,0 +1,95 @@
+================================================================================
+RL TripleA Auto-Research Progress Log
+================================================================================
+Last 500 lines kept. Oldest entries trimmed automatically.
+================================================================================
+
+[2026-03-31 18:30] ITERATION #34 — V3 TRAINING STARTED
+  State: Training RUNNING (PID active)
+  Architecture: V3 GNN+Attention (690k params) — fresh from scratch
+  Win Rate: 80% (iter 0, 353 games)
+  Speed: 339 sps (GPU 86%, Rust 11%, NumPy 3%)
+  League: Inactive (0 snapshots, activates at 2+ snapshots)
+  Config: +60 PU Axis bid, ±500 terminal reward, 5x Axis epochs, 0.05 entropy
+  ETA: ~53h for 2000 iterations
+  Action: Started V3 training from scratch on Mac Studio
+  Next: Auto-check in 30 minutes
+
+[2026-03-31 12:30] ITERATION #35 — POST-REBOOT MONITORING
+  Cause: Mac Studio rebooted at 11:22 AM (macOS 26.3 critical security update)
+  Training: RUNNING (PID 10277, restarted 12:14 PM, 64 envs)
+  Metrics: Iter 10 | 2,079 games | Allied 76% | 490 sps | GPU 80%
+  Assessment: Win rate above sweet spot but Axis still learning (85% → 76% in 10 iters)
+  Speed: 490 sps — excellent (threshold: 300). GPU 80% — no bottleneck.
+  Action: None. Let training continue. Need 50+ iters before judging.
+  Cron: Re-enabling auto-research cron (lost on reboot).
+  Next: Auto-check in 30 minutes.
+
+[2026-03-31 13:00] ITERATION #36 — FAILED: FLOAT16 AUTOCAST + TORCH.COMPILE
+  Attempted: float16 autocast + torch.compile for GPU throughput
+  Result: FAILED on two fronts:
+    1. torch.compile + autocast crashes MPS (Metal can't mix f16/f32 in compiled graph)
+    2. Autocast alone causes NaN in GNN attention (f16 can't handle -inf masking)
+    3. Even before NaN, was SLOWER (404 sps vs 490 sps) — model too small for AMP
+  Root cause: 690k param model is too small for mixed precision to help.
+    Type conversion overhead (f32→f16→f32) dominates the matmul savings.
+  Action: Reverted to clean float32. Restarted training from scratch.
+  Current: Iter 0 | 500 sps | GPU 80% | Allied 81% — healthy baseline
+  Lesson: AMP helps large models (100M+ params). This model is 690k — not worth it.
+
+[2026-03-31 13:15] ITERATION #37 — V3 ARCHITECTURE OVERHAUL (5 OPTIMIZATIONS)
+  Changes: (1) Sparse message passing (not dense attention), (2) 2 GNN layers (not 3),
+    (3) 64 embed dim (not 128), (4) Removed dead W_msg, (5) Pre-computed adjacency
+  Result: 5.2x speedup — 500 sps → 2,614 sps
+  Params: 690k → 117k (83% reduction)
+  GPU: 80% → 57% (no longer bottleneck!)
+  Bottleneck: Now Rust engine at 36% of wall time
+  Config: 256 envs, batch 1024, 2000 iterations
+  Win Rate: 75% at iter 0 (early, meaningless)
+  ETA to 50 iterations: ~20 minutes
+  Next: Monitor learning quality. If win rate tracks similarly to old V3, huge win.
+
+[2026-03-31 13:35] ITERATION #39 — AUTO-RESEARCH MONITORING
+  Training: RUNNING (256 envs, sparse GNN V3, 117k params)
+  Metrics: Iter 0 | 642 games | Allied 68% | 2,568 sps | GPU 55% | Rust 38%
+  Assessment: Win rate 68% — IN SWEET SPOT at iter 0! Promising start.
+  Bottleneck: Rust engine (16 CPU cores maxed). GPU has headroom.
+  Hardware tuning: 256 envs optimal (512 gave no gain, Rust-limited).
+  Action: None. Let training continue. Need 50+ iters before judging.
+  Next: Auto-check in 10 minutes.
+
+[2026-03-31 14:05] ITERATION #40 — ASYNC PIPELINE IMPLEMENTED
+  Changes: (1) PPO runs in background thread (overlaps with next rollout),
+    (2) Vectorized league opponent assignment (torch ops, no Python loop),
+    (3) Removed explicit mps.synchronize() (.cpu() handles sync implicitly),
+    (4) Vectorized episode tracking (numpy mask ops, no Python loop)
+  Result: 16% speedup — 2,600 sps → 3,020 sps
+  GPU utilization: 55% → 72% (PPO + inference running concurrently)
+  Rust percentage: 38% → 19% (overlaps with PPO GPU work)
+  Cumulative speedup from original dense V3: 500 → 3,020 sps = 6x
+  Win Rate: 67% at iter 5 — in sweet spot, training healthy
+  ETA to iter 50: ~15 minutes
+
+[2026-03-31 15:05] ITERATION #46 — MICRO: AXIS PPO EPOCHS 3x → 5x
+  Trigger: Win rate 74.9% and climbing even with league active (2 snapshots)
+  Change: Axis PPO epochs 3x→5x (12→20 epochs per iteration)
+  Rationale: Allied learning faster than Axis. League diversity alone insufficient.
+    More Axis gradient steps should produce a stronger opponent.
+  Resumed from: iter 100 checkpoint (75k games, 2 league snapshots)
+  Expected: Win rate drops toward 55-70% sweet spot within 30-50 iters
+  Risk: May slow training speed (more PPO work per iter in async thread)
+  Architecture summary at iter 115:
+    - Sparse GNN V3: 117k params, 2 layers, 64 embed
+    - Async pipeline: PPO overlapped with rollout
+    - Speed: 2,605 sps, GPU 83%, Rust 13%
+    - Total: 87k games, 7.6M steps
+
+[2026-03-31 15:45] ITERATION #50 — CRITICAL: AXIS BID WAS MISSING!
+  Finding: train_selfplay.py had NO Axis bid. The +60 PU bid only existed in
+    train_phase2.py (V2 training). All V3 training was against standard Axis.
+  Action: Added +64 PU Axis bid directly to train_selfplay.py
+    Japanese +20 (51 total), Germans +28 (65 total), Italians +16 (26 total)
+  Impact: Allied dropped from 75.7% (no bid) to 70% (with bid) at iter 0
+  Config: Sparse GNN V3 (117k), async pipeline, 5x Axis epochs, +64 PU bid
+  Fresh start from scratch. Need 50 iters to judge.
+  Lesson: Always verify game config matches program.md assumptions!
