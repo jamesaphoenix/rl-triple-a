@@ -84,6 +84,7 @@ struct TripleAEngine {
     chinese_territories: Vec<bool>,
     national_objectives: Vec<NationalObjective>,
     canals: Vec<CanalDef>,
+    conquered_this_turn: Vec<bool>,
 
     units: Vec<i32>,
     owner: Vec<i32>,
@@ -252,7 +253,7 @@ impl TripleAEngine {
             round: 1, current_player: 0, done: false, winner: -1,
             pending_purchase: [0; NUM_UNIT_TYPES],
             rng: Xoshiro256PlusPlus::seed_from_u64(seed),
-            reset_counter: 0, obs_size,
+            conquered_this_turn: vec![false; num_t], reset_counter: 0, obs_size,
         })
     }
 
@@ -474,6 +475,8 @@ impl TripleAEngine {
         let p = self.current_player;
         let pa = is_axis(p);
         let mut tuv_swing: f32 = 0.0;
+        // Reset conquered tracking for placement restriction
+        self.conquered_this_turn = vec![false; self.num_t];
         // FIX #11: track which territories had ownership changed by blitz this turn
         let mut blitz_captured: Vec<usize> = Vec::new();
 
@@ -622,6 +625,7 @@ impl TripleAEngine {
                             self.add_unit(src, p, u, -1);
                             self.add_unit(t, p, u, 1);
                             self.owner[t] = p as i32;
+                            self.conquered_this_turn[t] = true;
                             self.try_capture_capital(t, p, pa);
                             break;
                         }
@@ -759,6 +763,7 @@ impl TripleAEngine {
                 }
                 if !is_sea {
                     self.owner[t] = p as i32;
+                    self.conquered_this_turn[t] = true;
                     self.try_capture_capital(t, p, pa);
                 }
             } else {
@@ -905,6 +910,7 @@ impl TripleAEngine {
 
     fn auto_place(&mut self) {
         let p = self.current_player;
+        let pa = is_axis(p);
         let pur = self.pending_purchase;
 
         // FIX #17: Chinese placement — check existing unit count < 3
@@ -930,7 +936,8 @@ impl TripleAEngine {
         // FIX #23: original factories get unlimited production
         let mut factories: Vec<(usize, i32)> = Vec::new();
         for t in 0..self.num_t {
-            if self.owner[t] == p as i32 && self.get_unit(t, p, FAC) > 0 {
+            if self.owner[t] == p as i32 && self.get_unit(t, p, FAC) > 0
+                && !self.conquered_this_turn[t] {  // Can't produce from conquered factory
                 // Check if this is an "original" factory (existed at game start for original owner)
                 let is_original = self.init_owner[t] == p as i32;
                 let capacity = if is_original {
@@ -962,6 +969,13 @@ impl TripleAEngine {
             }
             for n in 0..self.num_t {
                 if self.adj(f, n) && self.is_water[n] {
+                    // Can't place sea units where enemy combat ships are
+                    let enemy_naval = (0..NUM_PLAYERS).any(|ep| {
+                        is_axis(ep) != pa && (0..NUM_UNIT_TYPES).any(|u| {
+                            UNIT_IS_SEA[u] && UNIT_IS_COMBAT[u] && self.get_unit(n, ep, u) > 0
+                        })
+                    });
+                    if enemy_naval { continue; }
                     for u in 0..NUM_UNIT_TYPES {
                         if sea_rem[u] > 0 {
                             self.add_unit(n, p, u, sea_rem[u]);
@@ -1374,7 +1388,7 @@ impl BatchEngine {
                 round: 1, current_player: 0, done: false, winner: -1,
                 pending_purchase: [0; NUM_UNIT_TYPES],
                 rng: Xoshiro256PlusPlus::seed_from_u64(i as u64),
-                reset_counter: 0, obs_size,
+                conquered_this_turn: vec![false; num_t], reset_counter: 0, obs_size,
             });
         }
         Ok(BatchEngine { engines, num_envs, obs_size, num_t })
