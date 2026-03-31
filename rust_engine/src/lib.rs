@@ -798,10 +798,10 @@ impl TripleAEngine {
             // Check if battle is already over after pre-combat removals
             let atk_combat: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| atk[i]).sum();
             let dfn_combat_remaining: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
-            let wins = if atk_combat == 0 || dfn_combat_remaining == 0 {
-                atk_combat > 0 && dfn_combat_remaining == 0
+            let (wins, retreated) = if atk_combat == 0 || dfn_combat_remaining == 0 {
+                (atk_combat > 0 && dfn_combat_remaining == 0, false)
             } else {
-                resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng)
+                resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng, 0)
             };
 
             // Restore submerged subs (they survived, just exited combat)
@@ -1310,7 +1310,8 @@ impl TripleAEngine {
                         for u in 0..NUM_UNIT_TYPES { dfn[u] += self.get_unit(t, ep, u); }
                     }
                 }
-                if resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng) {
+                let (axis_wins, _axis_retreated) = resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng, 0);
+                if axis_wins {
                     for u in 0..NUM_UNIT_TYPES { self.set_unit(t, p, u, atk[u]); }
                     for ep in 0..NUM_PLAYERS {
                         if !is_axis(ep) { for u in 0..NUM_UNIT_TYPES { self.set_unit(t, ep, u, 0); } }
@@ -1342,15 +1343,20 @@ impl TripleAEngine {
 
 // ── Combat Resolution ────────────────────────────────────────
 
+/// Returns: (attacker_wins, attacker_retreated)
+/// attacker_wins: true if attacker destroyed all defenders
+/// attacker_retreated: true if attacker pulled back mid-combat (surviving units remain)
 fn resolve_combat_ww2v3(
     atk: &mut [i32; NUM_UNIT_TYPES],
     dfn: &mut [i32; NUM_UNIT_TYPES],
     rng: &mut Xoshiro256PlusPlus,
-) -> bool {
+    retreat_after_round: i32, // 0 = never retreat, >0 = retreat after this many rounds
+) -> (bool, bool) {
     let mut atk_bb_dmg = 0i32;
     let mut dfn_bb_dmg = 0i32;
+    let initial_atk_tuv = calc_tuv(atk);
 
-    for _ in 0..12 {
+    for round in 0..12 {
         let ac: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| atk[i]).sum();
         let dc: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
         if ac == 0 || dc == 0 { break; }
@@ -1418,11 +1424,25 @@ fn resolve_combat_ww2v3(
 
         atk_bb_dmg = atk_bb_dmg.min(atk[BB]);
         dfn_bb_dmg = dfn_bb_dmg.min(dfn[BB]);
+
+        // FIX #32: Retreat check — attacker can retreat after each round
+        if retreat_after_round > 0 && round + 1 >= retreat_after_round as u32 {
+            // Attacker retreats with surviving units
+            return (false, true); // didn't win, but retreated (not destroyed)
+        }
+
+        // Heuristic retreat: if attacker lost >60% of TUV, auto-retreat
+        if retreat_after_round == 0 {
+            let current_tuv = calc_tuv(atk);
+            if initial_atk_tuv > 0.0 && current_tuv / initial_atk_tuv < 0.4 {
+                return (false, true); // heavy losses, retreat
+            }
+        }
     }
 
     let ac: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| atk[i]).sum();
     let dc: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
-    ac > 0 && dc == 0
+    (ac > 0 && dc == 0, false) // (attacker_wins, retreated)
 }
 
 // FIX #4: interleave INF/ART casualties, FIX #6/#11: transports LAST
