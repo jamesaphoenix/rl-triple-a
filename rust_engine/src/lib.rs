@@ -204,13 +204,46 @@ impl TripleAEngine {
         true
     }
 
-    fn is_valid_chinese_move(&self, unit_type: usize, target: usize) -> bool {
+    fn is_valid_chinese_move(&self, _unit_type: usize, target: usize) -> bool {
         if self.current_player != CHINESE { return true; }
         // FIX #15: restrict ALL units including air, not just land
         if target < self.chinese_territories.len() {
             return self.chinese_territories[target];
         }
         false
+    }
+
+    /// Transfer infrastructure (FAC, AA) from old owner to new owner on conquest.
+    /// TripleA: BattleTracker.captureOrDestroyUnits → ChangeFactory.changeOwner
+    fn transfer_infrastructure(&mut self, t: usize, new_owner: usize) {
+        for ep in 0..NUM_PLAYERS {
+            if ep == new_owner { continue; }
+            for &u in &[FAC, AA] {
+                let count = self.get_unit(t, ep, u);
+                if count > 0 {
+                    self.set_unit(t, ep, u, 0);
+                    self.add_unit(t, new_owner, u, count);
+                }
+            }
+        }
+    }
+
+    /// Route a captured territory to the correct owner per TripleA liberation rules.
+    /// If the territory's original owner is an ally who still has their capital,
+    /// the territory goes to the original owner (liberation), not the capturer.
+    fn liberation_owner(&self, t: usize, capturer: usize) -> usize {
+        let orig = self.init_owner[t];
+        if orig < 0 { return capturer; }
+        let orig_player = orig as usize;
+        // Only liberate if the original owner is an ally (same coalition), not the capturer
+        if orig_player == capturer { return capturer; }
+        if is_axis(orig_player) != is_axis(capturer) { return capturer; }
+        // Only liberate if the original owner still has their capital
+        if self.player_has_capital(orig_player) {
+            orig_player
+        } else {
+            capturer
+        }
     }
 }
 
@@ -243,7 +276,8 @@ impl TripleAEngine {
         let pus_slice = initial_pus.as_slice()?;
         let mut pus = [0i32; NUM_PLAYERS];
         for i in 0..NUM_PLAYERS.min(pus_slice.len()) { pus[i] = pus_slice[i]; }
-        let obs_size = num_t * (NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 2)
+        // Per-territory: 7 owner + 91 units + production + is_water + factory_damage + conquered + is_vc = 96+5
+        let obs_size = num_t * (NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 5)
             + NUM_PLAYERS * 2 + 1;
 
         Ok(TripleAEngine {
@@ -260,17 +294,19 @@ impl TripleAEngine {
         })
     }
 
+    #[pyo3(signature = (player, value, territories, count, enemy_sea_zones, allied_exclusion, direct_ownership=None))]
     fn add_national_objective(
         &mut self, player: usize, value: i32,
         territories: PyReadonlyArray1<i32>, count: i32,
         enemy_sea_zones: PyReadonlyArray1<i32>,
         allied_exclusion: bool,
+        direct_ownership: Option<bool>,
     ) -> PyResult<()> {
         let terrs: Vec<usize> = territories.as_slice()?.iter().map(|&x| x as usize).collect();
         let seas: Vec<usize> = enemy_sea_zones.as_slice()?.iter().map(|&x| x as usize).collect();
         self.national_objectives.push(NationalObjective {
             player, value, territories: terrs, count, enemy_sea_zones: seas,
-            allied_exclusion, direct_ownership: false, // default: allied ownership
+            allied_exclusion, direct_ownership: direct_ownership.unwrap_or(false),
         });
         Ok(())
     }
@@ -333,7 +369,7 @@ impl TripleAEngine {
         let attacks = attack_scores.as_slice()?;
         let reinforce = reinforce_scores.as_slice()?;
         let pre_a_vc = self.count_vc(true);
-        let pre_a_inc = self.calc_income(true);
+        let pre_x_vc = self.count_vc(false);
         self.execute_purchase(purchase);
         let tuv_swing = self.execute_combat(attacks);
         self.execute_noncombat(reinforce);
@@ -341,10 +377,10 @@ impl TripleAEngine {
         self.end_turn();
         self.play_axis_turns();
         let post_a_vc = self.count_vc(true);
-        let post_a_inc = self.calc_income(true);
+        let post_x_vc = self.count_vc(false);
         let mut reward: f32 = tuv_swing * 0.01
             + (post_a_vc - pre_a_vc) as f32 * 2.0
-            + (post_a_inc - pre_a_inc) as f32 * 0.05;
+            - (post_x_vc - pre_x_vc) as f32 * 2.0;
         if self.done {
             if self.winner == 1 { reward += 500.0; }
             else if self.winner == 0 { reward -= 500.0; }
@@ -437,8 +473,11 @@ impl TripleAEngine {
             }
             obs.push(self.production[t] as f32 / 12.0);
             obs.push(if self.is_water[t] { 1.0 } else { 0.0 });
+            obs.push(self.factory_damage[t] as f32 / 20.0);
+            obs.push(if self.conquered_this_turn[t] { 1.0 } else { 0.0 });
+            obs.push(if self.is_victory_city[t] { 1.0 } else { 0.0 });
         }
-        for p in 0..NUM_PLAYERS { obs.push(self.pus[p] as f32 / 50.0); }
+        for p in 0..NUM_PLAYERS { obs.push(self.pus[p] as f32 / 100.0); }
         obs.push(self.round as f32 / 20.0);
         for p in 0..NUM_PLAYERS { obs.push(if self.current_player == p { 1.0 } else { 0.0 }); }
         obs
@@ -471,7 +510,7 @@ impl TripleAEngine {
 
         let mut purchase = [0i32; NUM_UNIT_TYPES];
         for i in 0..NUM_UNIT_TYPES.min(action.len()) {
-            let count = (action[i] * 20.0).round().max(0.0).min(20.0) as i32;
+            let count = (action[i] * 30.0).round().max(0.0).min(30.0) as i32;
             let affordable = budget / UNIT_COST[i].max(1);
             let actual = count.min(affordable);
             purchase[i] = actual;
@@ -680,7 +719,9 @@ impl TripleAEngine {
                         if (UNIT_IS_LAND[u] || UNIT_IS_AIR[u]) && av[u] > 0 {
                             self.add_unit(src, p, u, -1);
                             self.add_unit(t, p, u, 1);
-                            self.owner[t] = p as i32;
+                            let actual_owner = self.liberation_owner(t, p);
+                            self.owner[t] = actual_owner as i32;
+                            self.transfer_infrastructure(t, actual_owner);
                             self.conquered_this_turn[t] = true;
                             self.try_capture_capital(t, p, pa);
                             break;
@@ -772,23 +813,27 @@ impl TripleAEngine {
             // FIX #36: Pre-battle sub submerge — subs can submerge if no enemy DD
             // Defending subs submerge if attacker has no DD
             if dfn[SUB] > 0 && atk[DD] == 0 {
-                // Heuristic: defender subs always submerge when they can (optimal defense)
                 submerged_dfn_subs = dfn[SUB];
                 dfn[SUB] = 0;
+            }
+            // FIX #37: Attacking subs can also submerge if no defender DD
+            // TripleA: OffensiveSubsRetreat — attacker subs retreat/submerge before battle
+            if atk[SUB] > 0 && dfn[DD] == 0 {
+                // Heuristic: attacking subs submerge when facing only air (can't be hit)
+                let dfn_only_air = (dfn[FTR] + dfn[BMB] > 0)
+                    && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| dfn[u] == 0);
+                if dfn_only_air {
+                    submerged_atk_subs = atk[SUB];
+                    atk[SUB] = 0;
+                }
             }
 
             // Sub submerge vs only-air (forced)
             let atk_all_air = (atk[FTR] + atk[BMB] > 0)
                 && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| atk[u] == 0);
-            let dfn_all_air = (dfn[FTR] + dfn[BMB] > 0)
-                && [INF, ART, ARM, TRN, SUB, DD, CRU, CAR, BB].iter().all(|&u| dfn[u] == 0);
             if atk_all_air && dfn[SUB] > 0 {
                 submerged_dfn_subs += dfn[SUB];
                 dfn[SUB] = 0;
-            }
-            if dfn_all_air && atk[SUB] > 0 {
-                submerged_atk_subs = atk[SUB];
-                atk[SUB] = 0;
             }
 
             // ── Resolve battle ───────────────────────────────
@@ -798,7 +843,7 @@ impl TripleAEngine {
             // Check if battle is already over after pre-combat removals
             let atk_combat: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| atk[i]).sum();
             let dfn_combat_remaining: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
-            let (wins, retreated) = if atk_combat == 0 || dfn_combat_remaining == 0 {
+            let (wins, _retreated) = if atk_combat == 0 || dfn_combat_remaining == 0 {
                 (atk_combat > 0 && dfn_combat_remaining == 0, false)
             } else {
                 resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng, 0)
@@ -845,13 +890,19 @@ impl TripleAEngine {
                         self.set_unit(t, p, u, atk[u]);
                     }
                 }
+                // Transfer infrastructure BEFORE zeroing enemy units
+                if !is_sea {
+                    let actual_owner = self.liberation_owner(t, p);
+                    self.transfer_infrastructure(t, actual_owner);
+                }
                 for ep in 0..NUM_PLAYERS {
                     if is_axis(ep) != pa {
                         for u in 0..NUM_UNIT_TYPES { self.set_unit(t, ep, u, 0); }
                     }
                 }
                 if !is_sea {
-                    self.owner[t] = p as i32;
+                    let actual_owner = self.liberation_owner(t, p);
+                    self.owner[t] = actual_owner as i32;
                     self.conquered_this_turn[t] = true;
                     self.try_capture_capital(t, p, pa);
                 }
@@ -1224,7 +1275,9 @@ impl TripleAEngine {
         let mut inc = 0;
         for t in 0..self.num_t {
             let o = self.owner[t];
-            if o >= 0 && is_axis(o as usize) != allied { inc += self.production[t]; }
+            if o >= 0 && !self.is_water[t] && is_axis(o as usize) != allied {
+                inc += self.production[t];
+            }
         }
         inc
     }
@@ -1239,6 +1292,8 @@ impl TripleAEngine {
 
     fn axis_turn(&mut self) {
         let p = self.current_player;
+        // FIX #38: reset conquered_this_turn per axis player (prevents state leaking between players)
+        self.conquered_this_turn = vec![false; self.num_t];
         let budget = self.pus[p];
         let mut pur = [0i32; NUM_UNIT_TYPES];
         let mut rem = budget;
@@ -1294,7 +1349,10 @@ impl TripleAEngine {
                     if (UNIT_IS_LAND[u] || UNIT_IS_AIR[u]) && av[u] > 0 {
                         self.add_unit(src, p, u, -1);
                         self.add_unit(t, p, u, 1);
-                        self.owner[t] = p as i32;
+                        let actual_owner = self.liberation_owner(t, p);
+                        self.owner[t] = actual_owner as i32;
+                        self.transfer_infrastructure(t, actual_owner);
+                        self.conquered_this_turn[t] = true;
                         self.try_capture_capital(t, p, true);
                         break;
                     }
@@ -1313,11 +1371,17 @@ impl TripleAEngine {
                 let (axis_wins, _axis_retreated) = resolve_combat_ww2v3(&mut atk, &mut dfn, &mut self.rng, 0);
                 if axis_wins {
                     for u in 0..NUM_UNIT_TYPES { self.set_unit(t, p, u, atk[u]); }
+                    if !is_sea {
+                        let actual_owner = self.liberation_owner(t, p);
+                        self.transfer_infrastructure(t, actual_owner);
+                    }
                     for ep in 0..NUM_PLAYERS {
                         if !is_axis(ep) { for u in 0..NUM_UNIT_TYPES { self.set_unit(t, ep, u, 0); } }
                     }
                     if !is_sea {
-                        self.owner[t] = p as i32;
+                        let actual_owner = self.liberation_owner(t, p);
+                        self.owner[t] = actual_owner as i32;
+                        self.conquered_this_turn[t] = true;
                         self.try_capture_capital(t, p, true);
                     }
                 } else {
@@ -1383,43 +1447,57 @@ fn resolve_combat_ww2v3(
         let dc2: i32 = (0..NUM_UNIT_TYPES).filter(|&i| UNIT_IS_COMBAT[i]).map(|i| dfn[i]).sum();
         if ac2 == 0 || dc2 == 0 { break; }
 
-        // General combat — attacking
-        let mut ah = 0i32;
+        // General combat — attacking (split air vs surface hits)
+        let mut ah_air = 0i32;  // hits from air units (can't target subs without DD)
+        let mut ah_surface = 0i32;  // hits from surface units (can always target subs)
         for i in 0..NUM_UNIT_TYPES {
             if !UNIT_IS_COMBAT[i] || atk[i] == 0 { continue; }
             if i == SUB && !dfn_has_dd { continue; } // already fired in first-strike
             if i == INF {
                 let sup = atk[i].min(atk[ART]);
-                for _ in 0..sup { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] + 1 { ah += 1; } }
-                for _ in 0..(atk[i] - sup) { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] { ah += 1; } }
+                for _ in 0..sup { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] + 1 { ah_surface += 1; } }
+                for _ in 0..(atk[i] - sup) { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] { ah_surface += 1; } }
             } else {
-                for _ in 0..atk[i] { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] { ah += 1; } }
+                let hits_ref = if UNIT_IS_AIR[i] { &mut ah_air } else { &mut ah_surface };
+                for _ in 0..atk[i] { if rng.gen_range(1..=6) <= UNIT_ATTACK[i] { *hits_ref += 1; } }
             }
         }
 
-        // General combat — defending
-        let mut dh = 0i32;
+        // General combat — defending (split air vs surface hits)
+        let mut dh_air = 0i32;
+        let mut dh_surface = 0i32;
         for i in 0..NUM_UNIT_TYPES {
             if !UNIT_IS_COMBAT[i] || dfn[i] == 0 { continue; }
             // FIX #5: skip defending subs that already fired in first-strike
             if i == SUB && !atk_has_dd { continue; }
-            for _ in 0..dfn[i] { if rng.gen_range(1..=6) <= UNIT_DEFENSE[i] { dh += 1; } }
+            let hits_ref = if UNIT_IS_AIR[i] { &mut dh_air } else { &mut dh_surface };
+            for _ in 0..dfn[i] { if rng.gen_range(1..=6) <= UNIT_DEFENSE[i] { *hits_ref += 1; } }
         }
 
-        // BB 2-hit absorption
+        // BB 2-hit absorption (applied to total hits)
+        let mut ah = ah_air + ah_surface;
+        let mut dh = dh_air + dh_surface;
         while ah > 0 && dfn_bb_dmg < dfn[BB] { dfn_bb_dmg += 1; ah -= 1; }
         while dh > 0 && atk_bb_dmg < atk[BB] { atk_bb_dmg += 1; dh -= 1; }
 
-        // Air can't hit subs without destroyer: skip SUB in casualty order
+        // FIX #39: Air hits can't target subs without destroyer, but surface hits can
+        // Apply surface hits first (can hit anything), then air hits (skip subs if no DD)
+        let ah_surface_actual = ah_surface.min(ah); // may be reduced by BB absorption
+        let ah_air_actual = ah - ah_surface_actual;
+        apply_casualties_ww2v3(dfn, ah_surface_actual);
         if atk_has_dd {
-            apply_casualties_ww2v3(dfn, ah);
+            apply_casualties_ww2v3(dfn, ah_air_actual);
         } else {
-            apply_casualties_no_sub(dfn, ah);
+            apply_casualties_no_sub(dfn, ah_air_actual);
         }
+
+        let dh_surface_actual = dh_surface.min(dh);
+        let dh_air_actual = dh - dh_surface_actual;
+        apply_casualties_ww2v3(atk, dh_surface_actual);
         if dfn_has_dd {
-            apply_casualties_ww2v3(atk, dh);
+            apply_casualties_ww2v3(atk, dh_air_actual);
         } else {
-            apply_casualties_no_sub(atk, dh);
+            apply_casualties_no_sub(atk, dh_air_actual);
         }
 
         atk_bb_dmg = atk_bb_dmg.min(atk[BB]);
@@ -1551,7 +1629,8 @@ impl BatchEngine {
         let pus_s = initial_pus.as_slice()?;
         let mut pus = [0i32; NUM_PLAYERS];
         for i in 0..NUM_PLAYERS.min(pus_s.len()) { pus[i] = pus_s[i]; }
-        let obs_size = num_t * (NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 2)
+        // Must match TripleAEngine::new obs_size formula
+        let obs_size = num_t * (NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 5)
             + NUM_PLAYERS * 2 + 1;
 
         let mut engines = Vec::with_capacity(num_envs);
@@ -1617,7 +1696,6 @@ impl BatchEngine {
             .map(|(eng, &(pur, atk, rnf))| {
                 let pre_a_vc = eng.count_vc(true);
                 let pre_x_vc = eng.count_vc(false); // FIX #4: capture pre_x_vc
-                let pre_a_inc = eng.calc_income(true);
                 let player = eng.current_player;
                 let pa = is_axis(player);
 
@@ -1630,9 +1708,8 @@ impl BatchEngine {
 
                 let post_a_vc = eng.count_vc(true);
                 let post_x_vc = eng.count_vc(false);
-                let post_a_inc = eng.calc_income(true);
 
-                // EXPERIMENT #4: Axis 3x VC reward for aggressive play
+                // Aligned reward: matches step_single formula for both sides
                 let reward = if pa {
                     tuv * -0.01 + (post_x_vc - pre_x_vc) as f32 * 6.0
                         - (post_a_vc - pre_a_vc) as f32 * 6.0
@@ -1640,7 +1717,7 @@ impl BatchEngine {
                           else if eng.done && eng.winner == 1 { -500.0 } else { 0.0 }
                 } else {
                     tuv * 0.01 + (post_a_vc - pre_a_vc) as f32 * 2.0
-                        + (post_a_inc - pre_a_inc) as f32 * 0.05
+                        - (post_x_vc - pre_x_vc) as f32 * 2.0
                         + if eng.done && eng.winner == 1 { 500.0 }
                           else if eng.done && eng.winner == 0 { -500.0 } else { 0.0 }
                 };
@@ -1690,19 +1767,39 @@ impl BatchEngine {
         PyArray1::from_vec(py, flags)
     }
 
+    #[pyo3(signature = (player, value, territories, count, enemy_sea_zones, allied_exclusion, direct_ownership=None))]
     fn add_national_objective(
         &mut self, player: usize, value: i32,
         territories: PyReadonlyArray1<i32>, count: i32,
         enemy_sea_zones: PyReadonlyArray1<i32>,
         allied_exclusion: bool,
+        direct_ownership: Option<bool>,
     ) -> PyResult<()> {
         let terrs: Vec<usize> = territories.as_slice()?.iter().map(|&x| x as usize).collect();
         let seas: Vec<usize> = enemy_sea_zones.as_slice()?.iter().map(|&x| x as usize).collect();
+        let direct = direct_ownership.unwrap_or(false);
         for eng in &mut self.engines {
             eng.national_objectives.push(NationalObjective {
                 player, value, territories: terrs.clone(), count,
                 enemy_sea_zones: seas.clone(), allied_exclusion,
-                direct_ownership: false,
+                direct_ownership: direct,
+            });
+        }
+        Ok(())
+    }
+
+    /// Add a canal definition to ALL engines in the batch.
+    fn add_canal(
+        &mut self,
+        sea_zone_a: usize,
+        sea_zone_b: usize,
+        land_territories: PyReadonlyArray1<i32>,
+    ) -> PyResult<()> {
+        let lands: Vec<usize> = land_territories.as_slice()?.iter().map(|&x| x as usize).collect();
+        for eng in &mut self.engines {
+            eng.canals.push(CanalDef {
+                sea_zone_a, sea_zone_b,
+                land_territories: lands.clone(),
             });
         }
         Ok(())

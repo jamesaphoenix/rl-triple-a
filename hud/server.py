@@ -119,6 +119,11 @@ class Recommender:
             self.engine.add_national_objective(
                 no["player"], no["value"], no["territories"],
                 no["count"], no["enemy_sea_zones"], no.get("allied_exclusion", False),
+                no.get("direct_ownership", False),
+            )
+        for canal in self.arrays.get("canals", []):
+            self.engine.add_canal(
+                canal["sea_zone_a"], canal["sea_zone_b"], canal["land_territories"],
             )
 
         obs_size = self.engine.get_obs_size()

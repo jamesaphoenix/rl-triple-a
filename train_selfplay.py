@@ -99,6 +99,12 @@ def train_selfplay(
         batch_eng.add_national_objective(
             no["player"], no["value"], no["territories"],
             no["count"], no["enemy_sea_zones"], no.get("allied_exclusion", False),
+            no.get("direct_ownership", False),
+        )
+    # Register canals on all engines
+    for canal in arrays.get("canals", []):
+        batch_eng.add_canal(
+            canal["sea_zone_a"], canal["sea_zone_b"], canal["land_territories"],
         )
 
     num_t = batch_eng.get_num_territories()

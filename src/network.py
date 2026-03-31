@@ -83,11 +83,12 @@ class TerritoryEncoder(nn.Module):
 
     def __init__(self, territory_embed_dim: int = 64):
         super().__init__()
-        # Raw per-territory features: owner(7) + units(7*13=91) + production(1) + water(1) = 100
-        raw_per_terr = NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 2
+        # Raw per-territory features: owner(7) + units(7*13=91) + production(1) + water(1)
+        #   + factory_damage(1) + conquered(1) + is_vc(1) = 103
+        raw_per_terr = NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 5
         # We compress: owner(7) + friendly_units(13) + enemy_units(13) + friendly_strength(1)
-        #   + enemy_strength(1) + production(1) + water(1) = 37
-        compressed_dim = 37
+        #   + enemy_strength(1) + production(1) + water(1) + factory_dmg(1) + conquered(1) + vc(1) = 40
+        compressed_dim = 40
 
         self.compress = nn.Sequential(
             nn.Linear(raw_per_terr, compressed_dim),
@@ -101,7 +102,7 @@ class TerritoryEncoder(nn.Module):
 
     def forward(self, obs, is_axis_player: torch.Tensor = None):
         batch = obs.shape[0]
-        raw_per_terr = NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 2
+        raw_per_terr = NUM_PLAYERS + NUM_PLAYERS * NUM_UNIT_TYPES + 5
         global_dim = NUM_PLAYERS * 2 + 1  # pus(7) + round(1) + player_onehot(7)
 
         # Split territory features from global

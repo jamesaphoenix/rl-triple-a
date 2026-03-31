@@ -68,43 +68,44 @@ def export_map_arrays() -> dict:
     # National Objectives — resolved to territory indices
     # Format: (player_name, value, [territory_names], count, [enemy_sea_zone_names])
     # Format: (player, value, territories, count, enemy_sea_zones, allied_exclusion)
+    # Format: (player, value, territories, count, enemy_sea_zones, allied_exclusion, direct_ownership)
     national_objectives_raw = [
         # Germans
         ("Germans", 5, ["France", "Northwestern Europe", "Germany", "Poland",
-                        "Czechoslovakia Hungary", "Bulgaria Romania"], 6, [], False),
+                        "Czechoslovakia Hungary", "Bulgaria Romania"], 6, [], False, True),
         ("Germans", 5, ["Baltic States", "East Poland", "Belorussia",
-                        "Eastern Ukraine", "Ukraine"], 3, [], False),
-        ("Germans", 5, ["Karelia S.S.R.", "Caucasus"], 1, [], False),
+                        "Eastern Ukraine", "Ukraine"], 3, [], False, False),
+        ("Germans", 5, ["Karelia S.S.R.", "Caucasus"], 1, [], False, False),
         # Russians — FIX #18: first NO has allied_exclusion=True
-        ("Russians", 5, ["Archangel"], 1, [], True),
+        ("Russians", 5, ["Archangel"], 1, [], True, True),
         ("Russians", 10, ["Norway", "Finland", "Poland", "Bulgaria Romania",
-                          "Czechoslovakia Hungary", "Balkans"], 3, [], False),
+                          "Czechoslovakia Hungary", "Balkans"], 3, [], False, False),
         # Japanese
-        ("Japanese", 5, ["Manchuria", "Kiangsu", "French Indo-China Thailand"], 3, [], False),
+        ("Japanese", 5, ["Manchuria", "Kiangsu", "French Indo-China Thailand"], 3, [], False, True),
         ("Japanese", 5, ["Kwangtung", "East Indies", "Borneo", "Philippine Islands",
-                         "New Guinea", "Solomon Islands"], 4, [], False),
-        ("Japanese", 5, ["Hawaiian Islands", "Australia", "India"], 1, [], False),
+                         "New Guinea", "Solomon Islands"], 4, [], False, True),
+        ("Japanese", 5, ["Hawaiian Islands", "Australia", "India"], 1, [], False, False),
         # British
         ("British", 5, ["Caroline Islands", "French Indo-China Thailand", "Formosa",
-                        "Iwo Jima", "Japan", "Okinawa"], 1, [], False),
+                        "Iwo Jima", "Japan", "Okinawa"], 1, [], False, False),
         ("British", 5, ["Eastern Canada", "Western Canada", "Gibraltar", "Egypt",
-                        "Australia", "Union of South Africa"], 6, [], False),
-        ("British", 5, ["France", "Balkans"], 1, [], False),
+                        "Australia", "Union of South Africa"], 6, [], False, True),
+        ("British", 5, ["France", "Balkans"], 1, [], False, False),
         # Italians
-        ("Italians", 5, ["Egypt", "Trans-Jordan", "France", "Gibraltar"], 3, [], False),
+        ("Italians", 5, ["Egypt", "Trans-Jordan", "France", "Gibraltar"], 3, [], False, False),
         ("Italians", 5, ["Italy", "Balkans", "Morocco Algeria", "Libya"], 4,
-         ["13 Sea Zone", "14 Sea Zone", "15 Sea Zone"], False),
+         ["13 Sea Zone", "14 Sea Zone", "15 Sea Zone"], False, True),
         # Americans
-        ("Americans", 5, ["France"], 1, [], False),
-        ("Americans", 5, ["Philippine Islands"], 1, [], False),
+        ("Americans", 5, ["France"], 1, [], False, False),
+        ("Americans", 5, ["Philippine Islands"], 1, [], False, True),
         ("Americans", 5, ["Western United States", "Eastern United States",
-                          "Central United States"], 3, [], False),
+                          "Central United States"], 3, [], False, True),
         ("Americans", 5, ["Midway", "Wake Island", "Hawaiian Islands",
-                          "Solomon Islands"], 3, [], False),
+                          "Solomon Islands"], 3, [], False, False),
     ]
 
     national_objectives = []
-    for player_name, value, terr_names, count, sea_names, allied_excl in national_objectives_raw:
+    for player_name, value, terr_names, count, sea_names, allied_excl, direct_own in national_objectives_raw:
         player_idx = PLAYER_IDX[player_name]
         terr_indices = np.array([tidx[n] for n in terr_names if n in tidx], dtype=np.int32)
         sea_indices = np.array([tidx[n] for n in sea_names if n in tidx], dtype=np.int32)
@@ -115,7 +116,31 @@ def export_map_arrays() -> dict:
             "count": count,
             "enemy_sea_zones": sea_indices,
             "allied_exclusion": allied_excl,
+            "direct_ownership": direct_own,
         })
+
+    # Canals — parsed from XML, convert territory names to indices
+    # WW2v3 has Suez Canal (Egypt + Trans-Jordan, connecting 34 Sea Zone + 17 Sea Zone)
+    # and Panama Canal (Central America, connecting 18 Sea Zone + 19 Sea Zone)
+    canals = []
+    # Group canal entries by name to find paired sea zones
+    canal_groups: dict[str, list[dict]] = {}
+    for c in md.canals:
+        name = c.get("name", "unknown")
+        canal_groups.setdefault(name, []).append(c)
+    for name, entries in canal_groups.items():
+        if len(entries) >= 2:
+            # Two entries = two sea zones connected by the canal
+            sz_a = entries[0]["sea_zone"]
+            sz_b = entries[1]["sea_zone"]
+            if sz_a in tidx and sz_b in tidx:
+                land_terrs = entries[0].get("land_territories", [])
+                land_indices = np.array([tidx[n] for n in land_terrs if n in tidx], dtype=np.int32)
+                canals.append({
+                    "sea_zone_a": tidx[sz_a],
+                    "sea_zone_b": tidx[sz_b],
+                    "land_territories": land_indices,
+                })
 
     return {
         "adjacency": adjacency,
@@ -130,4 +155,5 @@ def export_map_arrays() -> dict:
         "initial_pus": initial_pus,
         "territory_names": names,
         "national_objectives": national_objectives,
+        "canals": canals,
     }
