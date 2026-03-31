@@ -23,7 +23,7 @@ import torch.nn as nn
 import torch.optim as optim
 
 from src.game_data_export import export_map_arrays
-from src.network import ActorCriticV2
+from src.network import ActorCriticV2, ActorCriticV3
 from triplea_engine import BatchEngine
 
 NUM_UNIT_TYPES = 13
@@ -98,10 +98,12 @@ def train_selfplay(
     print(f"Steps/iter: {steps_per_iter} | Batch: {batch_size}")
     print(f"Rayon parallel across all CPU cores")
 
-    # Two networks
-    # FIX #9: use model's internal log_std, don't create external parameter
-    allied_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
-    axis_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
+    # Two networks — V3 architecture with GNN + attention
+    adj_matrix = torch.from_numpy(arrays["adjacency"]).bool()
+    allied_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
+                                 num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
+    axis_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
+                               num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
     # FIX #10: include ALL parameters (including model.log_std) in optimizer
     allied_opt = optim.Adam(allied_model.parameters(), lr=lr, eps=1e-5)
     axis_opt = optim.Adam(axis_model.parameters(), lr=lr, eps=1e-5)
@@ -113,7 +115,8 @@ def train_selfplay(
     print(f"Params/agent: {params:,}")
 
     league = deque(maxlen=20)  # Store up to 20 past Axis snapshots
-    league_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
+    league_model = ActorCriticV3(obs_size, action_dim, territory_embed_dim=128,
+                                 num_gnn_layers=3, num_heads=4, adj_matrix=adj_matrix).to(device)
     league_model.eval()
 
     # ── Resume from checkpoint or start fresh ──
@@ -132,38 +135,55 @@ def train_selfplay(
         if ckpts:
             resume_path = ckpts[-1]
 
+    resumed = False
     if resume_path:
         log(f"  [Resume] Loading checkpoint: {resume_path}")
         ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        allied_model.load_state_dict(ckpt["allied"])
-        axis_model.load_state_dict(ckpt["axis"])
-        if "allied_opt" in ckpt:
-            allied_opt.load_state_dict(ckpt["allied_opt"])
-        if "axis_opt" in ckpt:
-            axis_opt.load_state_dict(ckpt["axis_opt"])
-        start_iteration = ckpt.get("iteration", 0)
-        allied_wins = ckpt.get("allied_wins", 0)
-        axis_wins = ckpt.get("axis_wins", 0)
-        total_games = ckpt.get("total_games", 0)
-        total_steps = ckpt.get("total_steps", 0)
-        # Restore league
-        for snap in ckpt.get("league", []):
-            league.append(snap)
-        log(f"  [Resume] Iter {start_iteration}, {total_games:,} games, "
-            f"Allied {allied_wins/max(total_games,1):.0%}, league: {len(league)} snapshots")
-    else:
+        # Check architecture compatibility
+        ckpt_keys = set(ckpt["allied"].keys())
+        model_keys_check = set(allied_model.state_dict().keys())
+        if ckpt_keys != model_keys_check:
+            log(f"  [Resume] Checkpoint uses different architecture — starting fresh instead")
+        else:
+            allied_model.load_state_dict(ckpt["allied"])
+            axis_model.load_state_dict(ckpt["axis"])
+            if "allied_opt" in ckpt:
+                allied_opt.load_state_dict(ckpt["allied_opt"])
+            if "axis_opt" in ckpt:
+                axis_opt.load_state_dict(ckpt["axis_opt"])
+            start_iteration = ckpt.get("iteration", 0)
+            allied_wins = ckpt.get("allied_wins", 0)
+            axis_wins = ckpt.get("axis_wins", 0)
+            total_games = ckpt.get("total_games", 0)
+            total_steps = ckpt.get("total_steps", 0)
+            for snap in ckpt.get("league", []):
+                league.append(snap)
+            log(f"  [Resume] Iter {start_iteration}, {total_games:,} games, "
+                f"Allied {allied_wins/max(total_games,1):.0%}, league: {len(league)} snapshots")
+            resumed = True
+
+    if not resumed:
         log(f"  [Fresh] No checkpoint found, starting from scratch")
-        # Pre-seed league with foundation model's Axis weights if available
+        # Pre-seed league with foundation model's Axis weights if compatible
         foundation_path = "checkpoints_selfplay_v3/foundation_v1_282k_games_93pct.pt"
         if os.path.exists(foundation_path):
             try:
                 fnd = torch.load(foundation_path, map_location="cpu", weights_only=False)
+                # Check architecture compatibility before loading
                 if "axis" in fnd:
-                    league.append(fnd["axis"])
-                    log(f"  [League] Pre-seeded with foundation Axis (282k games)")
+                    test_keys = set(fnd["axis"].keys())
+                    model_keys = set(axis_model.state_dict().keys())
+                    if test_keys == model_keys:
+                        league.append(fnd["axis"])
+                        log(f"  [League] Pre-seeded with foundation Axis (282k games)")
+                    else:
+                        log(f"  [League] Foundation uses different architecture — skipping pre-seed")
                 for snap in fnd.get("league", []):
                     if "axis" in snap:
-                        league.append(snap["axis"])
+                        snap_keys = set(snap["axis"].keys()) if isinstance(snap, dict) else set(snap.keys())
+                        if snap_keys == model_keys:
+                            league.append(snap["axis"] if isinstance(snap, dict) and "axis" in snap else snap)
+                        # Skip incompatible snapshots silently
                 if len(league) > 1:
                     log(f"  [League] Total pre-seeded snapshots: {len(league)}")
             except Exception as e:
