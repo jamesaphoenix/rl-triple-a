@@ -1277,8 +1277,17 @@ fn resolve_combat_ww2v3(
         while ah > 0 && dfn_bb_dmg < dfn[BB] { dfn_bb_dmg += 1; ah -= 1; }
         while dh > 0 && atk_bb_dmg < atk[BB] { atk_bb_dmg += 1; dh -= 1; }
 
-        apply_casualties_ww2v3(dfn, ah);
-        apply_casualties_ww2v3(atk, dh);
+        // Air can't hit subs without destroyer: skip SUB in casualty order
+        if atk_has_dd {
+            apply_casualties_ww2v3(dfn, ah);
+        } else {
+            apply_casualties_no_sub(dfn, ah);
+        }
+        if dfn_has_dd {
+            apply_casualties_ww2v3(atk, dh);
+        } else {
+            apply_casualties_no_sub(atk, dh);
+        }
 
         atk_bb_dmg = atk_bb_dmg.min(atk[BB]);
         dfn_bb_dmg = dfn_bb_dmg.min(dfn[BB]);
@@ -1327,6 +1336,29 @@ fn apply_casualties_ww2v3(units: &mut [i32; NUM_UNIT_TYPES], mut hits: i32) {
         let rm = units[TRN].min(hits);
         units[TRN] -= rm;
     }
+}
+
+/// Same as apply_casualties_ww2v3 but skips SUB (air can't hit subs without destroyer)
+fn apply_casualties_no_sub(units: &mut [i32; NUM_UNIT_TYPES], mut hits: i32) {
+    if hits <= 0 { return; }
+    let inf_excess = (units[INF] - units[ART]).max(0);
+    let art_excess = (units[ART] - units[INF]).max(0);
+    let rm = inf_excess.min(hits); units[INF] -= rm; hits -= rm;
+    let rm = art_excess.min(hits); units[ART] -= rm; hits -= rm;
+    while hits > 0 && units[INF] > 0 && units[ART] > 0 {
+        units[INF] -= 1; hits -= 1;
+        if hits > 0 { units[ART] -= 1; hits -= 1; }
+    }
+    let rm = units[INF].min(hits); units[INF] -= rm; hits -= rm;
+    let rm = units[ART].min(hits); units[ART] -= rm; hits -= rm;
+    // Skip SUB — air can't target subs
+    for &ui in &[CAR, DD, ARM, FTR, CRU, BMB, BB] {
+        if hits <= 0 { break; }
+        let rm = units[ui].min(hits);
+        units[ui] -= rm;
+        hits -= rm;
+    }
+    if hits > 0 { let rm = units[TRN].min(hits); units[TRN] -= rm; }
 }
 
 fn calc_tuv(units: &[i32; NUM_UNIT_TYPES]) -> f32 {
