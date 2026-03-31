@@ -629,8 +629,34 @@ impl TripleAEngine {
                         }
                     }
                 }
-                // Note: 3-hop bomber attack omitted for performance (O(n³)).
-                // Bombers within 2 hops can attack. Full 3-hop range is a minor edge case.
+                // 3-hop bomber attack via BFS (range 6 = 3 out + 3 back)
+                {
+                    let mut dist = vec![u32::MAX; self.num_t];
+                    dist[t] = 0;
+                    let mut queue = vec![t];
+                    let mut qi = 0;
+                    while qi < queue.len() {
+                        let cur = queue[qi]; qi += 1;
+                        if dist[cur] >= 3 { continue; }
+                        for next in 0..self.num_t {
+                            if self.adj(cur, next) && !self.is_impassable[next] && dist[next] == u32::MAX {
+                                dist[next] = dist[cur] + 1;
+                                queue.push(next);
+                            }
+                        }
+                    }
+                    // Gather bombers at exactly 3 hops (not 1 or 2, those already handled)
+                    for n3 in 0..self.num_t {
+                        if dist[n3] != 3 { continue; }
+                        let c = self.get_unit(n3, p, BMB);
+                        if c > 0 {
+                            let mut a = [0i32; NUM_UNIT_TYPES];
+                            a[BMB] = c;
+                            atk[BMB] += c;
+                            sources.push((n3, a));
+                        }
+                    }
+                }
             }
 
             let atk_combat: i32 = (0..NUM_UNIT_TYPES)
