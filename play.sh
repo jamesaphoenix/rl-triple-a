@@ -4,6 +4,13 @@
 
 cd "$(dirname "$0")"
 
+# Clear old autosaves so HUD starts fresh
+SAVE_DIR="$HOME/triplea/savedGames/autoSave"
+if [ -d "$SAVE_DIR" ]; then
+    rm -f "$SAVE_DIR"/*.tsvg 2>/dev/null
+    echo "Cleared old autosaves"
+fi
+
 # Find the latest checkpoint
 MODEL=""
 for f in checkpoints_phase2/selfplay_final.pt \

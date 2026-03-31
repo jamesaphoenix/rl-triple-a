@@ -283,10 +283,10 @@ class Recommender:
                         "action": f"Move {', '.join(movable)} from {n_name} → {tname}",
                     })
 
-            if move_orders:
+            if move_orders or not game_state:
                 attack_recs.append({
                     "territory": tname,
-                    "owner": t_owner,
+                    "owner": t_owner if game_state else "enemy",
                     "production": int(self.arrays["production"][t_idx]),
                     "priority": float(score),
                     "orders": move_orders,
