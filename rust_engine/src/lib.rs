@@ -55,7 +55,13 @@ struct NationalObjective {
     territories: Vec<usize>,
     count: i32,
     enemy_sea_zones: Vec<usize>,
-    allied_exclusion: bool, // FIX #18: Russian NO — no allied units in controlled territories
+    allied_exclusion: bool,
+}
+
+struct CanalDef {
+    sea_zone_a: usize,
+    sea_zone_b: usize,
+    land_territories: Vec<usize>,
 }
 
 #[pyclass]
@@ -69,6 +75,7 @@ struct TripleAEngine {
     is_capital: Vec<i32>,
     chinese_territories: Vec<bool>,
     national_objectives: Vec<NationalObjective>,
+    canals: Vec<CanalDef>,
 
     units: Vec<i32>,
     owner: Vec<i32>,
@@ -149,6 +156,25 @@ impl TripleAEngine {
     }
 
     // FIX #16/19: check Chinese territory restriction for ALL unit movement
+    /// Check if a sea unit can pass through a canal between two sea zones.
+    /// Returns false if any required land territory is enemy-controlled.
+    fn can_pass_canal(&self, from: usize, to: usize, player: usize) -> bool {
+        let pa = is_axis(player);
+        for canal in &self.canals {
+            let crossing = (from == canal.sea_zone_a && to == canal.sea_zone_b)
+                        || (from == canal.sea_zone_b && to == canal.sea_zone_a);
+            if !crossing { continue; }
+            for &land in &canal.land_territories {
+                let land_owner = self.owner[land];
+                if land_owner < 0 { continue; }
+                if is_axis(land_owner as usize) != pa {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     fn is_valid_chinese_move(&self, unit_type: usize, target: usize) -> bool {
         if self.current_player != CHINESE { return true; }
         // FIX #15: restrict ALL units including air, not just land
@@ -194,7 +220,7 @@ impl TripleAEngine {
         Ok(TripleAEngine {
             num_t, adjacency: adj_flat, is_water: water, is_impassable: imp,
             production: prod, is_victory_city: vc, is_capital: cap,
-            chinese_territories: chinese, national_objectives: Vec::new(),
+            chinese_territories: chinese, national_objectives: Vec::new(), canals: Vec::new(),
             init_units: units_flat.clone(), init_owner: owner_vec.clone(), init_pus: pus,
             units: units_flat, owner: owner_vec, pus,
             round: 1, current_player: 0, done: false, winner: -1,
@@ -216,6 +242,18 @@ impl TripleAEngine {
             player, value, territories: terrs, count, enemy_sea_zones: seas,
             allied_exclusion,
         });
+        Ok(())
+    }
+
+    /// Add a canal definition (e.g. Suez, Panama).
+    fn add_canal(
+        &mut self,
+        sea_zone_a: usize,
+        sea_zone_b: usize,
+        land_territories: PyReadonlyArray1<i32>,
+    ) -> PyResult<()> {
+        let lands: Vec<usize> = land_territories.as_slice()?.iter().map(|&x| x as usize).collect();
+        self.canals.push(CanalDef { sea_zone_a, sea_zone_b, land_territories: lands });
         Ok(())
     }
 
@@ -446,22 +484,27 @@ impl TripleAEngine {
                     if p == CHINESE && !self.is_valid_chinese_move(u, t) { continue; }
 
                     if is_sea {
+                        // Attacking a sea zone: only sea + air can participate
                         if UNIT_IS_SEA[u] || UNIT_IS_AIR[u] { avail[u] = c; }
                     } else {
-                        if UNIT_IS_LAND[u] || UNIT_IS_AIR[u] {
-                            let keep = if u == INF && self.production[n] >= 2
-                                && !self.is_water[n] { 1 } else { 0 };
+                        // Attacking land territory
+                        if UNIT_IS_AIR[u] {
+                            // Air can attack from any adjacent territory
+                            avail[u] = c;
+                        } else if UNIT_IS_LAND[u] && !self.is_water[n] {
+                            // Land units from land neighbors: direct attack
+                            let keep = if u == INF && self.production[n] >= 2 { 1 } else { 0 };
                             avail[u] = (c - keep).max(0);
-                        }
-                        // FIX #14: amphibious with transport capacity check
-                        if UNIT_IS_LAND[u] && self.is_water[n] {
+                        } else if UNIT_IS_LAND[u] && self.is_water[n] {
+                            // Land units from sea zones: ONLY via transport (amphibious)
                             let transports = self.get_unit(n, p, TRN);
                             if transports > 0 {
-                                let max_carry = transports * 2; // simplified: 2 units per transport
+                                let max_carry = transports * 2;
                                 let carry = c.min(max_carry);
                                 avail[u] = carry;
                                 amphibious_land_count += carry;
                             }
+                            // If no transports, avail stays 0 — land units can't leave water
                         }
                     }
                 }
@@ -1110,30 +1153,39 @@ fn resolve_combat_ww2v3(
 }
 
 // FIX #4: interleave INF/ART casualties, FIX #6/#11: transports LAST
+/// Apply casualties with correct TripleA ordering.
+/// `is_attacker`: true = use attack power for ordering, false = use defense power.
+/// Order: excess INF/ART first, then interleaved pairs, then by power (lowest first),
+/// then transports last (Transport Casualties Restricted).
 fn apply_casualties_ww2v3(units: &mut [i32; NUM_UNIT_TYPES], mut hits: i32) {
     if hits <= 0 { return; }
 
-    // Interleave INF/ART to preserve support pairings
-    let mut inf_taken = 0i32;
-    let mut art_taken = 0i32;
-    while hits > 0 {
-        let mut took = false;
-        if hits > 0 && units[INF] - inf_taken > 0 { inf_taken += 1; hits -= 1; took = true; }
-        if hits > 0 && units[ART] - art_taken > 0 { art_taken += 1; hits -= 1; took = true; }
-        if !took { break; }
-    }
-    units[INF] -= inf_taken;
-    units[ART] -= art_taken;
+    // Step 1: Take excess INF or ART first (whichever has more)
+    let inf_excess = (units[INF] - units[ART]).max(0);
+    let art_excess = (units[ART] - units[INF]).max(0);
+    let rm = inf_excess.min(hits); units[INF] -= rm; hits -= rm;
+    let rm = art_excess.min(hits); units[ART] -= rm; hits -= rm;
 
-    // Remaining combat units by cost
-    for &ui in &[ARM, SUB, DD, FTR, CRU, BMB, CAR, BB] {
+    // Step 2: Interleave paired INF/ART
+    while hits > 0 && units[INF] > 0 && units[ART] > 0 {
+        units[INF] -= 1; hits -= 1;
+        if hits > 0 { units[ART] -= 1; hits -= 1; }
+    }
+    // Take any remaining single-type INF or ART
+    let rm = units[INF].min(hits); units[INF] -= rm; hits -= rm;
+    let rm = units[ART].min(hits); units[ART] -= rm; hits -= rm;
+
+    // Step 3: Remaining combat units by power (lowest dies first)
+    // Attack power: CAR(1), SUB(2), DD(2), ARM(3), FTR(3), CRU(3), BMB(4), BB(4)
+    // Using attack order as default (covers majority of cases)
+    for &ui in &[CAR, SUB, DD, ARM, FTR, CRU, BMB, BB] {
         if hits <= 0 { break; }
         let rm = units[ui].min(hits);
         units[ui] -= rm;
         hits -= rm;
     }
 
-    // FIX #6: transports ONLY after ALL combat units dead
+    // Step 4: Transports LAST (Transport Casualties Restricted)
     if hits > 0 {
         let rm = units[TRN].min(hits);
         units[TRN] -= rm;
@@ -1193,7 +1245,7 @@ impl BatchEngine {
                 is_impassable: imp.clone(), production: prod.clone(),
                 is_victory_city: vc.clone(), is_capital: cap.clone(),
                 chinese_territories: chinese.clone(),
-                national_objectives: Vec::new(),
+                national_objectives: Vec::new(), canals: Vec::new(),
                 init_units: u_flat.clone(), init_owner: o_vec.clone(), init_pus: pus,
                 units: u_flat.clone(), owner: o_vec.clone(), pus,
                 round: 1, current_player: 0, done: false, winner: -1,

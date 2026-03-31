@@ -252,6 +252,9 @@ class Recommender:
             tname = self.territory_names[t_idx]
             if self.arrays["is_impassable"][t_idx]:
                 continue
+            # Skip sea zones for land attack recommendations (no transport validation yet)
+            if self.arrays["is_water"][t_idx]:
+                continue
             # Check this territory is enemy-owned
             t_owner = owners_map.get(tname)
             if t_owner == player:
