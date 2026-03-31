@@ -519,7 +519,11 @@ impl TripleAEngine {
 
                     if is_sea {
                         // Attacking a sea zone: only sea + air can participate
-                        if UNIT_IS_SEA[u] || UNIT_IS_AIR[u] { avail[u] = c; }
+                        if UNIT_IS_SEA[u] || UNIT_IS_AIR[u] {
+                            // FIX #18: canal check for combat sea movement
+                            if UNIT_IS_SEA[u] && !self.can_pass_canal(n, t, p) { continue; }
+                            avail[u] = c;
+                        }
                     } else {
                         // Attacking land territory
                         if UNIT_IS_AIR[u] {
@@ -905,6 +909,21 @@ impl TripleAEngine {
                     if UNIT_IS_SEA[u] && !self.is_water[n] { continue; }
                     if UNIT_IS_LAND[u] && self.is_water[n] { continue; }
 
+                    // FIX #17: sea NCM restrictions
+                    if tgt_is_sea && UNIT_IS_SEA[u] {
+                        // Non-sub sea units can't enter enemy-occupied sea zones in NCM
+                        if u != SUB && self.territory_has_enemy_combat_units(tgt, pa) { continue; }
+                        // Subs blocked by enemy destroyers
+                        if u == SUB {
+                            let enemy_dd = (0..NUM_PLAYERS).any(|ep| {
+                                is_axis(ep) != pa && self.get_unit(tgt, ep, DD) > 0
+                            });
+                            if enemy_dd { continue; }
+                        }
+                        // Canal check for sea movement
+                        if !self.can_pass_canal(n, tgt, p) { continue; }
+                    }
+
                     // FIX #15/#16: Chinese ALL units restricted
                     if p == CHINESE && !self.is_valid_chinese_move(u, tgt) { continue; }
 
@@ -1011,10 +1030,14 @@ impl TripleAEngine {
                         })
                     });
                     if enemy_naval { continue; }
+                    // FIX #20: sea units share capacity pool with land
                     for u in 0..NUM_UNIT_TYPES {
-                        if sea_rem[u] > 0 {
-                            self.add_unit(n, p, u, sea_rem[u]);
-                            sea_rem[u] = 0;
+                        if !UNIT_IS_SEA[u] || sea_rem[u] <= 0 { continue; }
+                        let can_place = sea_rem[u].min((capacity - placed).max(0));
+                        if can_place > 0 {
+                            self.add_unit(n, p, u, can_place);
+                            sea_rem[u] -= can_place;
+                            placed += can_place;
                         }
                     }
                     break;
