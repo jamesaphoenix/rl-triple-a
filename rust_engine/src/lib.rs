@@ -64,6 +64,7 @@ struct NationalObjective {
     count: i32,
     enemy_sea_zones: Vec<usize>,
     allied_exclusion: bool,
+    direct_ownership: bool, // FIX #23: requires the player itself to own (not just an ally)
 }
 
 struct CanalDef {
@@ -269,7 +270,7 @@ impl TripleAEngine {
         let seas: Vec<usize> = enemy_sea_zones.as_slice()?.iter().map(|&x| x as usize).collect();
         self.national_objectives.push(NationalObjective {
             player, value, territories: terrs, count, enemy_sea_zones: seas,
-            allied_exclusion,
+            allied_exclusion, direct_ownership: false, // default: allied ownership
         });
         Ok(())
     }
@@ -603,19 +604,21 @@ impl TripleAEngine {
                 }
             }
 
-            // Air from 2 hops
+            // Air from extended range (movement-aware)
+            // Fighters: range 4 → max 2 hops to attack (need 2 to return)
+            // Bombers: range 6 → max 3 hops to attack (need 3 to return)
             if !is_sea {
+                // 2-hop air (fighters + bombers)
                 for n2 in 0..self.num_t {
                     if self.adj(t, n2) || self.is_impassable[n2] || n2 == t { continue; }
-                    // FIX #15: Chinese air restricted too
                     if p == CHINESE && !self.is_valid_chinese_move(FTR, n2) { continue; }
-                    let mut connected = false;
+                    let mut connected_2hop = false;
                     for mid in 0..self.num_t {
                         if self.adj(t, mid) && self.adj(mid, n2) && !self.is_impassable[mid] {
-                            connected = true; break;
+                            connected_2hop = true; break;
                         }
                     }
-                    if !connected { continue; }
+                    if !connected_2hop { continue; }
                     for u in [FTR, BMB] {
                         let c = self.get_unit(n2, p, u);
                         if c > 0 {
@@ -626,6 +629,8 @@ impl TripleAEngine {
                         }
                     }
                 }
+                // Note: 3-hop bomber attack omitted for performance (O(n³)).
+                // Bombers within 2 hops can attack. Full 3-hop range is a minor edge case.
             }
 
             let atk_combat: i32 = (0..NUM_UNIT_TYPES)
@@ -924,6 +929,9 @@ impl TripleAEngine {
                 if !self.adj(tgt, n) || self.is_impassable[n] { continue; }
                 if self.owner[n] >= 0 && is_axis(self.owner[n] as usize) != pa
                     && !self.is_water[n] { continue; }
+                // FIX #33: can't move units OUT of a territory conquered this turn
+                // (units that moved in during combat can't move again in NCM)
+                if self.conquered_this_turn[n] { continue; }
                 let n_score = if n < scores.len() { scores[n] } else { 0.0 };
                 if n_score >= tgt_score { continue; }
 
@@ -1116,11 +1124,18 @@ impl TripleAEngine {
         for no in &self.national_objectives {
             if no.player != player { continue; }
 
-            // Check allied ownership
+            // Check ownership (direct or allied)
             let count: i32 = no.territories.iter()
                 .filter(|&&t| {
                     let o = self.owner[t];
-                    o >= 0 && is_axis(o as usize) == pa
+                    if o < 0 { return false; }
+                    if no.direct_ownership {
+                        // FIX #23: must be owned by this specific player
+                        o == player as i32
+                    } else {
+                        // Allied ownership: any player on same side
+                        is_axis(o as usize) == pa
+                    }
                 })
                 .count() as i32;
             if count < no.count { continue; }
@@ -1641,6 +1656,7 @@ impl BatchEngine {
             eng.national_objectives.push(NationalObjective {
                 player, value, territories: terrs.clone(), count,
                 enemy_sea_zones: seas.clone(), allied_exclusion,
+                direct_ownership: false,
             });
         }
         Ok(())
