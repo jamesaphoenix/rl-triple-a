@@ -25,10 +25,10 @@ def export_with_axis_bid():
     # Japanese=0, Germans=2, Italians=4
     # Split: 8 to Germany, 6 to Japan, 4 to Italy
     arrays["initial_pus"] = arrays["initial_pus"].copy()
-    arrays["initial_pus"][0] += 13  # Japanese: 31 → 44
-    arrays["initial_pus"][2] += 17  # Germans: 37 → 54
-    arrays["initial_pus"][4] += 8   # Italians: 10 → 18
-    print(f"Axis bid applied (+38 total): Japanese {arrays['initial_pus'][0]}, "
+    arrays["initial_pus"][0] += 20  # Japanese: 31 → 51
+    arrays["initial_pus"][2] += 28  # Germans: 37 → 65
+    arrays["initial_pus"][4] += 12  # Italians: 10 → 22
+    print(f"Axis bid applied (+60 total): Japanese {arrays['initial_pus'][0]}, "
           f"Germans {arrays['initial_pus'][2]}, Italians {arrays['initial_pus'][4]}")
     return arrays
 
@@ -37,7 +37,7 @@ import src.game_data_export
 src.game_data_export.export_map_arrays = export_with_axis_bid
 
 # Now import and run training
-from train_selfplay_v3 import train_selfplay
+from train_selfplay import train_selfplay
 import torch
 
 FOUNDATION_MODEL = "checkpoints_selfplay_v3/foundation_v1_282k_games_93pct.pt"
@@ -69,7 +69,7 @@ if __name__ == "__main__":
         original_train(**kwargs)
 
     # Load and inject weights by patching ActorCriticV2 init
-    from src.network_v2 import ActorCriticV2
+    from src.network import ActorCriticV2
     _original_init = ActorCriticV2.__init__
     _loaded = {"done": False}
 

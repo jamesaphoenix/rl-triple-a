@@ -278,8 +278,8 @@ impl TripleAEngine {
             + (post_a_vc - pre_a_vc) as f32 * 2.0
             + (post_a_inc - pre_a_inc) as f32 * 0.05;
         if self.done {
-            if self.winner == 1 { reward += 100.0; }
-            else if self.winner == 0 { reward -= 100.0; }
+            if self.winner == 1 { reward += 500.0; }
+            else if self.winner == 0 { reward -= 500.0; }
         }
         self.make_result_dict(py, reward)
     }
@@ -308,13 +308,13 @@ impl TripleAEngine {
         let reward: f32 = if pa {
             tuv_swing * -0.01 + (post_x_vc - pre_x_vc) as f32 * 6.0
                 - (post_a_vc - pre_a_vc) as f32 * 6.0
-                + if self.done && self.winner == 0 { 100.0 }
-                  else if self.done && self.winner == 1 { -100.0 } else { 0.0 }
+                + if self.done && self.winner == 0 { 500.0 }
+                  else if self.done && self.winner == 1 { -500.0 } else { 0.0 }
         } else {
             tuv_swing * 0.01 + (post_a_vc - pre_a_vc) as f32 * 2.0
                 - (post_x_vc - pre_x_vc) as f32 * 2.0
-                + if self.done && self.winner == 1 { 100.0 }
-                  else if self.done && self.winner == 0 { -100.0 } else { 0.0 }
+                + if self.done && self.winner == 1 { 500.0 }
+                  else if self.done && self.winner == 0 { -500.0 } else { 0.0 }
         };
         self.make_result_dict(py, reward)
     }
@@ -1267,13 +1267,13 @@ impl BatchEngine {
                 let reward = if pa {
                     tuv * -0.01 + (post_x_vc - pre_x_vc) as f32 * 6.0
                         - (post_a_vc - pre_a_vc) as f32 * 6.0
-                        + if eng.done && eng.winner == 0 { 100.0 }
-                          else if eng.done && eng.winner == 1 { -100.0 } else { 0.0 }
+                        + if eng.done && eng.winner == 0 { 500.0 }
+                          else if eng.done && eng.winner == 1 { -500.0 } else { 0.0 }
                 } else {
                     tuv * 0.01 + (post_a_vc - pre_a_vc) as f32 * 2.0
                         + (post_a_inc - pre_a_inc) as f32 * 0.05
-                        + if eng.done && eng.winner == 1 { 100.0 }
-                          else if eng.done && eng.winner == 0 { -100.0 } else { 0.0 }
+                        + if eng.done && eng.winner == 1 { 500.0 }
+                          else if eng.done && eng.winner == 0 { -500.0 } else { 0.0 }
                 };
 
                 // Capture done/winner BEFORE reset

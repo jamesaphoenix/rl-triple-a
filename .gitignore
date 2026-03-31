@@ -1,4 +1,4 @@
-# Model checkpoints (too large for git)
+# Model checkpoints
 checkpoints_*/
 *.pt
 *.npz
@@ -10,21 +10,21 @@ runs*/
 
 # Build artifacts
 rust_engine/target/
-rust_engine/*.so
-rust_engine/*.dylib
+rust_engine/Cargo.lock
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
+*.so
+*.dylib
+*.class
 
-# TripleA clone (huge)
+# TripleA clone
 triplea/
 
-# Data files
-data/*.json
+# Data
+data/
 
-# Gradle cache
-.gradle/
+# Playwright
+.playwright-cli/
 
 # IDE
 .vscode/
@@ -32,15 +32,3 @@ data/*.json
 
 # OS
 .DS_Store
-*.swp
-
-# Conda/pip
-*.egg
-dist/
-build/
-
-# Playwright
-.playwright-cli/
-*.class
-Cargo.lock
-*.png

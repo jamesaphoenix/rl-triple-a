@@ -225,7 +225,7 @@ def test_neural_net_on_live_state():
         return True
 
     import torch
-    from src.network_v2 import ActorCriticV2
+    from src.network import ActorCriticV2
     from src.game_data_export import export_map_arrays
     from triplea_engine import TripleAEngine
 

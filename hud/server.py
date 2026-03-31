@@ -29,7 +29,7 @@ import numpy as np
 import torch
 
 from src.game_data_export import export_map_arrays
-from src.network_v2 import ActorCriticV2
+from src.network import ActorCriticV2
 from triplea_engine import TripleAEngine
 
 # ── Game State Extraction from .tsvg ────────────────────────

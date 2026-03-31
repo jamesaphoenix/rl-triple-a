@@ -27,6 +27,24 @@ Priority: HIGH items should be tried before MEDIUM/LOW.
 - Retreat mechanic — currently no retreat option in combat
 - Transport capacity enforcement (currently simplified)
 
+## URGENT — Architectural Change Needed (auto-research finding)
+
+The 80-82% Allied ceiling has been confirmed across 12 experiments and 2.15M games.
+Hyperparameter tuning is exhausted. The 8.9M param MLP on 16k observations has converged.
+
+**Recommended first change: Observation compression (16k → ~2k dims)**
+- 15 territories are impassable (zero information) — remove them
+- 65 sea zones mostly empty — compress to "has enemy navy" flags
+- Per-territory unit encoding (91 dims × 162) → only encode territories within 2 hops of frontline
+- First layer drops from 8.3M params to ~1M — remaining capacity focuses on strategy
+- Requires: changes to Rust `get_observation()` + Python `ActorCriticV2` input size
+- Estimated implementation: 30-60 min
+
+**Alternative: Double hidden layer size (512 → 1024)**
+- Simpler change but doesn't address the noise problem
+- Model goes from 8.9M to ~35M params
+- May overfit faster without observation compression
+
 ## Completed / Incorporated
 - ~~League training~~ — Done in Exp #7, 50% current + 30% league + 20% random
 - ~~Axis 3x VC reward~~ — Done in Exp #4, dropped Allied from 83% to 74%

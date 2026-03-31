@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
-"""Self-play PPO training: Allied and Axis agents learn against each other.
+"""Self-play V3: Rayon-parallel Rust batch engine + MPS GPU.
 
-Architecture:
-- Two separate neural networks: Allied policy and Axis policy
-- Both control their respective players via step_single()
-- Every N iterations, snapshot the opponent into a league of past versions
-- Train each side against a mix of: current opponent (50%) + random past opponent (50%)
-- Rust engine handles all game simulation at ~40k steps/sec
-
-This produces agents far stronger than any heuristic opponent.
+All 16 CPU cores run game simulations in parallel via Rayon.
+GPU handles all neural net inference in single batched forward passes.
+Zero Python-level loops over environments.
 """
 
 import sys
@@ -18,6 +13,9 @@ from pathlib import Path
 from collections import deque
 
 sys.path.insert(0, ".")
+import os
+import json
+import logging
 
 import numpy as np
 import torch
@@ -25,332 +23,460 @@ import torch.nn as nn
 import torch.optim as optim
 
 from src.game_data_export import export_map_arrays
-from src.network_v2 import ActorCriticV2
-from triplea_engine import TripleAEngine
-
-# Players: Japanese(0), Russians(1), Germans(2), British(3), Italians(4), Chinese(5), Americans(6)
-AXIS_PLAYERS = {0, 2, 4}
-ALLIED_PLAYERS = {1, 3, 5, 6}
+from src.network import ActorCriticV2
+from triplea_engine import BatchEngine
 
 NUM_UNIT_TYPES = 13
 
 
-def make_engine(seed=42):
-    arrays = export_map_arrays()
-    return TripleAEngine(
-        arrays["adjacency"], arrays["is_water"], arrays["is_impassable"],
-        arrays["production"], arrays["is_victory_city"], arrays["is_capital"],
-        arrays["chinese_territories"],
-        arrays["initial_units"], arrays["initial_owner"], arrays["initial_pus"],
-        seed=seed,
-    )
-
-
-def get_action(model, obs_tensor, log_std, device):
-    """Get action from a policy network."""
-    with torch.no_grad():
-        action_mean, value = model.forward(obs_tensor)
-        std = torch.exp(log_std).expand_as(action_mean)
-        dist = torch.distributions.Normal(action_mean, std)
-        action = dist.sample().clamp(0.0, 1.0)
-        log_prob = dist.log_prob(action).sum(dim=-1)
-    return action.cpu().numpy().squeeze(0), log_prob.item(), value.squeeze(-1).item()
-
-
-def compute_gae(rewards, values, dones, gamma=0.99, lam=0.95):
-    T = len(rewards)
-    advs = np.zeros(T, dtype=np.float32)
-    gae = 0.0
-    for t in reversed(range(T)):
-        next_val = values[t + 1] if t + 1 < T else 0.0
-        delta = rewards[t] + gamma * next_val * (1 - dones[t]) - values[t]
-        gae = delta + gamma * lam * (1 - dones[t]) * gae
-        advs[t] = gae
-    return advs, advs + np.array(values[:T])
-
-
-def ppo_update(model, optimizer, obs, actions, old_logp, advantages, returns, log_std,
-               device, epochs=4, batch_size=512, clip_eps=0.2):
-    N = obs.shape[0]
-    obs_t = torch.from_numpy(obs).to(device)
-    act_t = torch.from_numpy(actions).to(device)
-    old_logp_t = torch.from_numpy(old_logp).to(device)
-    adv_t = torch.from_numpy(advantages).to(device)
-    ret_t = torch.from_numpy(returns).to(device)
-
-    adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
-
-    model.train()
-    for _ in range(epochs):
-        perm = torch.randperm(N, device=device)
-        for start in range(0, N, batch_size):
-            idx = perm[start:start + batch_size]
-
-            action_mean, values = model.forward(obs_t[idx])
-            std = torch.exp(log_std).expand_as(action_mean)
-            dist_logp = -0.5 * ((act_t[idx] - action_mean) / std) ** 2 - torch.log(std) - 0.5 * np.log(2 * np.pi)
-            new_logp = dist_logp.sum(dim=-1)
-            entropy = (0.5 * torch.log(2 * np.pi * np.e * std ** 2)).sum(dim=-1).mean()
-
-            ratio = torch.exp(new_logp - old_logp_t[idx])
-            surr1 = ratio * adv_t[idx]
-            surr2 = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps) * adv_t[idx]
-            pg_loss = -torch.min(surr1, surr2).mean()
-            v_loss = nn.MSELoss()(values.squeeze(-1), ret_t[idx])
-
-            loss = pg_loss + 0.5 * v_loss - 0.02 * entropy
-
-            optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
-
-    return pg_loss.item(), v_loss.item()
-
-
-def collect_selfplay_rollout(engines, allied_model, axis_model, allied_log_std, axis_log_std,
-                              device, num_steps=128):
-    """Play games with both agents controlling their sides.
-
-    Returns separate rollout buffers for Allied and Axis.
+def compute_gae_batch(rewards, values, dones, last_values, gamma=0.99, lam=0.95):
+    """Vectorized GAE across all envs.
+    FIX #8: accepts last_values for bootstrap at rollout boundary.
     """
-    num_envs = len(engines)
-    num_t = engines[0].get_num_territories()
-    obs_size = engines[0].get_obs_size()
-    action_dim = NUM_UNIT_TYPES + num_t + num_t
-
-    # Buffers per side
-    allied_data = {"obs": [], "actions": [], "logp": [], "rewards": [], "values": [], "dones": []}
-    axis_data = {"obs": [], "actions": [], "logp": [], "rewards": [], "values": [], "dones": []}
-
-    episode_results = []
-
-    # Get current observations
-    current_obs = np.zeros((num_envs, obs_size), dtype=np.float32)
-    for i, eng in enumerate(engines):
-        current_obs[i] = np.array(eng.reset_selfplay(i))
-
-    total_steps = 0
-    while total_steps < num_steps * num_envs:
-        for i in range(num_envs):
-            if engines[i].is_done():
-                winner = engines[i].get_winner()
-                episode_results.append(winner)
-                current_obs[i] = np.array(engines[i].reset_selfplay(total_steps + i))
-
-            player = engines[i].get_current_player()
-            player_is_axis = player in AXIS_PLAYERS
-            model = axis_model if player_is_axis else allied_model
-            log_std = axis_log_std if player_is_axis else allied_log_std
-            data = axis_data if player_is_axis else allied_data
-
-            obs_tensor = torch.from_numpy(current_obs[i:i+1]).to(device)
-            action, logp, value = get_action(model, obs_tensor, log_std, device)
-
-            # Split action into components
-            purchase = action[:NUM_UNIT_TYPES].astype(np.float32)
-            attack = action[NUM_UNIT_TYPES:NUM_UNIT_TYPES + num_t].astype(np.float32)
-            reinforce = action[NUM_UNIT_TYPES + num_t:].astype(np.float32)
-
-            result = engines[i].step_single(purchase, attack, reinforce)
-
-            data["obs"].append(current_obs[i].copy())
-            data["actions"].append(action)
-            data["logp"].append(logp)
-            data["rewards"].append(result["reward"])
-            data["values"].append(value)
-            data["dones"].append(float(result["done"]))
-
-            current_obs[i] = np.array(result["obs"])
-            total_steps += 1
-
-    # Convert to numpy
-    for data in [allied_data, axis_data]:
-        for key in data:
-            if len(data[key]) > 0:
-                data[key] = np.array(data[key], dtype=np.float32)
-            else:
-                data[key] = np.zeros((0,), dtype=np.float32)
-
-    return allied_data, axis_data, episode_results
+    T, N = rewards.shape
+    advantages = np.zeros_like(rewards)
+    gae = np.zeros(N, dtype=np.float32)
+    for t in reversed(range(T)):
+        # FIX #8: use bootstrap values for final step instead of zeros
+        nv = values[t + 1] if t + 1 < T else last_values
+        delta = rewards[t] + gamma * nv * (1 - dones[t]) - values[t]
+        gae = delta + gamma * lam * (1 - dones[t]) * gae
+        advantages[t] = gae
+    return advantages, advantages + values
 
 
 def train_selfplay(
-    num_envs=32,
-    total_iterations=200,
-    num_steps=128,
-    batch_size=512,
+    num_envs=128,
+    total_iterations=500,
+    steps_per_iter=256,
+    num_epochs=4,
+    batch_size=1024,
     lr=3e-4,
-    save_dir="checkpoints_selfplay",
-    league_interval=20,
+    save_dir="checkpoints_selfplay_v3",
 ):
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
+
+    # File-based logging — bypasses conda stdout buffering
+    log_dir = Path(save_dir)
+    log_dir.mkdir(exist_ok=True)
+    timing_log = open(log_dir / "timing.jsonl", "w")
+    training_log = open(log_dir / "training.log", "w", buffering=1)  # line-buffered
+
+    def log(msg):
+        training_log.write(msg + "\n")
+        print(msg, flush=True)
+
+    def log_timing(data):
+        timing_log.write(json.dumps(data) + "\n")
+        timing_log.flush()
 
     save_path = Path(save_dir)
     save_path.mkdir(exist_ok=True)
 
-    engines = [make_engine(seed=i) for i in range(num_envs)]
-    num_t = engines[0].get_num_territories()
-    obs_size = engines[0].get_obs_size()
-    action_dim = NUM_UNIT_TYPES + num_t + num_t
+    # Create batch engine — all envs in one Rust object, parallel via Rayon
+    arrays = export_map_arrays()
+    batch_eng = BatchEngine(
+        num_envs,
+        arrays["adjacency"], arrays["is_water"], arrays["is_impassable"],
+        arrays["production"], arrays["is_victory_city"], arrays["is_capital"],
+        arrays["chinese_territories"],
+        arrays["initial_units"], arrays["initial_owner"], arrays["initial_pus"],
+    )
+    # Register national objectives on all engines
+    for no in arrays.get("national_objectives", []):
+        batch_eng.add_national_objective(
+            no["player"], no["value"], no["territories"],
+            no["count"], no["enemy_sea_zones"], no.get("allied_exclusion", False),
+        )
 
-    print(f"Envs: {num_envs} | Obs: {obs_size} | Actions: {action_dim}")
+    num_t = batch_eng.get_num_territories()
+    obs_size = batch_eng.get_obs_size()
+    action_dim = NUM_UNIT_TYPES + num_t + num_t  # purchase + attack + reinforce
 
-    # Two separate networks
+    print(f"Envs: {num_envs} | Obs: {obs_size} | Act: {action_dim}")
+    print(f"Steps/iter: {steps_per_iter} | Batch: {batch_size}")
+    print(f"Rayon parallel across all CPU cores")
+
+    # Two networks
+    # FIX #9: use model's internal log_std, don't create external parameter
     allied_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
     axis_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
-
-    allied_optimizer = optim.Adam(allied_model.parameters(), lr=lr, eps=1e-5)
-    axis_optimizer = optim.Adam(axis_model.parameters(), lr=lr, eps=1e-5)
-
-    allied_log_std = nn.Parameter(torch.full((action_dim,), -1.0, device=device))
-    axis_log_std = nn.Parameter(torch.full((action_dim,), -1.0, device=device))
-
-    # Add log_std to optimizers
-    allied_optimizer.add_param_group({"params": [allied_log_std]})
-    axis_optimizer.add_param_group({"params": [axis_log_std]})
+    # FIX #10: include ALL parameters (including model.log_std) in optimizer
+    allied_opt = optim.Adam(allied_model.parameters(), lr=lr, eps=1e-5)
+    axis_opt = optim.Adam(axis_model.parameters(), lr=lr, eps=1e-5)
+    # Use model's internal log_std instead of external parameter
+    allied_log_std = allied_model.log_std
+    axis_log_std = axis_model.log_std
 
     params = sum(p.numel() for p in allied_model.parameters())
-    print(f"Params per agent: {params:,} (x2 = {params*2:,} total)")
+    print(f"Params/agent: {params:,}")
 
-    # League: store past versions of each agent
-    allied_league = deque(maxlen=10)
-    axis_league = deque(maxlen=10)
+    league = deque(maxlen=20)  # Store up to 20 past Axis snapshots
+    league_model = ActorCriticV2(obs_size, action_dim, hidden_size=512).to(device)
+    league_model.eval()
 
-    start_time = time.time()
+    # ── Resume from checkpoint or start fresh ──
+    start_iteration = 0
     total_steps = 0
     allied_wins = 0
     axis_wins = 0
     total_games = 0
 
-    for iteration in range(total_iterations):
-        # LR annealing
+    # Find latest resumable checkpoint
+    resume_path = None
+    if os.path.exists(save_dir):
+        import glob
+        ckpts = sorted(glob.glob(str(save_path / "selfplay_*.pt")),
+                       key=lambda f: os.path.getmtime(f))
+        if ckpts:
+            resume_path = ckpts[-1]
+
+    if resume_path:
+        log(f"  [Resume] Loading checkpoint: {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        allied_model.load_state_dict(ckpt["allied"])
+        axis_model.load_state_dict(ckpt["axis"])
+        if "allied_opt" in ckpt:
+            allied_opt.load_state_dict(ckpt["allied_opt"])
+        if "axis_opt" in ckpt:
+            axis_opt.load_state_dict(ckpt["axis_opt"])
+        start_iteration = ckpt.get("iteration", 0)
+        allied_wins = ckpt.get("allied_wins", 0)
+        axis_wins = ckpt.get("axis_wins", 0)
+        total_games = ckpt.get("total_games", 0)
+        total_steps = ckpt.get("total_steps", 0)
+        # Restore league
+        for snap in ckpt.get("league", []):
+            league.append(snap)
+        log(f"  [Resume] Iter {start_iteration}, {total_games:,} games, "
+            f"Allied {allied_wins/max(total_games,1):.0%}, league: {len(league)} snapshots")
+    else:
+        log(f"  [Fresh] No checkpoint found, starting from scratch")
+        # Pre-seed league with foundation model's Axis weights if available
+        foundation_path = "checkpoints_selfplay_v3/foundation_v1_282k_games_93pct.pt"
+        if os.path.exists(foundation_path):
+            try:
+                fnd = torch.load(foundation_path, map_location="cpu", weights_only=False)
+                if "axis" in fnd:
+                    league.append(fnd["axis"])
+                    log(f"  [League] Pre-seeded with foundation Axis (282k games)")
+                for snap in fnd.get("league", []):
+                    if "axis" in snap:
+                        league.append(snap["axis"])
+                if len(league) > 1:
+                    log(f"  [League] Total pre-seeded snapshots: {len(league)}")
+            except Exception as e:
+                log(f"  [League] Could not load foundation for seeding: {e}")
+
+    use_league = len(league) >= 2
+    allied_log_std = allied_model.log_std
+    axis_log_std = axis_model.log_std
+
+    # Reset all engines
+    all_obs_flat = np.array(batch_eng.reset_all())
+    current_obs = all_obs_flat.reshape(num_envs, obs_size)
+
+    start_time = time.time()
+
+    for iteration in range(start_iteration, total_iterations):
         frac = 1.0 - iteration / total_iterations
-        for pg in allied_optimizer.param_groups:
-            pg["lr"] = lr * frac
-        for pg in axis_optimizer.param_groups:
-            pg["lr"] = lr * frac
+        for pg in allied_opt.param_groups: pg["lr"] = lr * frac
+        for pg in axis_opt.param_groups: pg["lr"] = lr * frac
 
-        # Collect self-play data
-        allied_data, axis_data, results = collect_selfplay_rollout(
-            engines, allied_model, axis_model,
-            allied_log_std, axis_log_std,
-            device, num_steps=num_steps,
-        )
+        # Rollout storage
+        all_obs_buf = np.zeros((steps_per_iter, num_envs, obs_size), dtype=np.float32)
+        all_act_buf = np.zeros((steps_per_iter, num_envs, action_dim), dtype=np.float32)
+        all_logp_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
+        all_val_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
+        all_rew_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
+        all_done_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
+        all_is_axis_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
 
-        # Track results
-        for w in results:
-            total_games += 1
-            if w == 0:
-                axis_wins += 1
-            elif w == 1:
-                allied_wins += 1
+        allied_model.eval()
+        axis_model.eval()
 
-        iter_steps = len(allied_data["obs"]) + len(axis_data["obs"])
-        total_steps += iter_steps
+        # Timing instrumentation
+        t_gpu = 0.0
+        t_rust = 0.0
+        t_numpy = 0.0
 
-        # Update Allied agent
-        allied_pg, allied_vl = 0.0, 0.0
-        if len(allied_data["obs"]) > 0:
-            adv, ret = compute_gae(allied_data["rewards"], list(allied_data["values"]),
-                                   allied_data["dones"])
-            allied_pg, allied_vl = ppo_update(
-                allied_model, allied_optimizer,
-                allied_data["obs"], allied_data["actions"], allied_data["logp"],
-                adv, ret, allied_log_std, device, batch_size=batch_size,
+        for step in range(steps_per_iter):
+            t0 = time.time()
+
+            is_axis_flags = np.array(batch_eng.get_is_axis())
+            axis_mask = is_axis_flags.astype(bool)
+
+            obs_tensor = torch.from_numpy(current_obs).to(device)
+
+            t1 = time.time()
+            # Batched GPU forward passes
+            with torch.no_grad():
+                # Allied always uses the main allied model
+                al_mean, al_val = allied_model.forward(obs_tensor)
+                al_std = torch.exp(allied_log_std).expand_as(al_mean)
+                al_dist = torch.distributions.Normal(al_mean, al_std)
+                al_actions = al_dist.sample().clamp(0.0, 1.0)
+                al_logp = al_dist.log_prob(al_actions).sum(-1)
+
+                # Axis: current model for all (used for training gradients)
+                ax_mean, ax_val = axis_model.forward(obs_tensor)
+                ax_std = torch.exp(axis_log_std).expand_as(ax_mean)
+                ax_dist = torch.distributions.Normal(ax_mean, ax_std)
+                ax_actions = ax_dist.sample().clamp(0.0, 1.0)
+                ax_logp = ax_dist.log_prob(ax_actions).sum(-1)
+
+                # LEAGUE: override some Axis envs with league opponents
+                if use_league and len(league) >= 2:
+                    league_ax_mean, _ = league_model.forward(obs_tensor)
+                    league_ax_std = torch.exp(league_model.log_std).expand_as(league_ax_mean)
+                    league_ax_dist = torch.distributions.Normal(league_ax_mean, league_ax_std)
+                    league_ax_actions = league_ax_dist.sample().clamp(0.0, 1.0)
+
+                    # Random noise actions (20% of Axis envs)
+                    random_actions = torch.rand_like(ax_actions)
+
+                    # Per-env opponent assignment:
+                    # 40% current Axis, 40% league snapshot, 20% random
+                    for i in range(num_envs):
+                        if not axis_mask[i]:
+                            continue
+                        r = np.random.random()
+                        if r < 0.40:
+                            pass  # keep current axis
+                        elif r < 0.80:
+                            ax_actions[i] = league_ax_actions[i]  # league opponent
+                        else:
+                            ax_actions[i] = random_actions[i]  # random noise
+
+            if device.type == 'mps':
+                torch.mps.synchronize()
+            t2 = time.time()
+            t_gpu += t2 - t1
+
+            actions_np = np.where(axis_mask[:, None],
+                ax_actions.cpu().numpy(), al_actions.cpu().numpy())
+            logp_np = np.where(axis_mask, ax_logp.cpu().numpy(), al_logp.cpu().numpy())
+            val_np = np.where(axis_mask, ax_val.squeeze(-1).cpu().numpy(),
+                             al_val.squeeze(-1).cpu().numpy())
+
+            purchases = actions_np[:, :NUM_UNIT_TYPES].astype(np.float32)
+            attack_scores = actions_np[:, NUM_UNIT_TYPES:NUM_UNIT_TYPES + num_t].astype(np.float32)
+            reinforce_scores = actions_np[:, NUM_UNIT_TYPES + num_t:NUM_UNIT_TYPES + 2 * num_t].astype(np.float32)
+            if reinforce_scores.shape[1] < num_t:
+                pad = np.zeros((num_envs, num_t - reinforce_scores.shape[1]), dtype=np.float32)
+                reinforce_scores = np.concatenate([reinforce_scores, pad], axis=1)
+
+            t3 = time.time()
+            t_numpy += t3 - t2
+
+            # Rayon-parallel game step
+            result = batch_eng.step_all(purchases, attack_scores, reinforce_scores)
+
+            t4 = time.time()
+            t_rust += t4 - t3
+
+            rewards = np.array(result["rewards"])
+            dones = np.array(result["dones"])
+            winners = np.array(result["winners"])
+            new_obs = np.array(result["obs"]).reshape(num_envs, obs_size)
+
+            # Track episodes
+            for i in range(num_envs):
+                if dones[i] > 0.5:
+                    total_games += 1
+                    if winners[i] == 0: axis_wins += 1
+                    elif winners[i] == 1: allied_wins += 1
+
+            # Store
+            all_obs_buf[step] = current_obs
+            all_act_buf[step] = actions_np
+            all_logp_buf[step] = logp_np
+            all_val_buf[step] = val_np
+            all_rew_buf[step] = rewards
+            all_done_buf[step] = dones
+            all_is_axis_buf[step] = is_axis_flags.astype(np.float32)
+
+            current_obs = new_obs
+            total_steps += num_envs
+
+        # === Compute GAE ===
+        # FIX #8: bootstrap value from final observation
+        with torch.no_grad():
+            obs_t = torch.from_numpy(current_obs).to(device)
+            is_axis_now = np.array(batch_eng.get_is_axis()).astype(bool)
+            _, al_boot = allied_model.forward(obs_t)
+            _, ax_boot = axis_model.forward(obs_t)
+            boot_vals = np.where(is_axis_now,
+                                 ax_boot.squeeze(-1).cpu().numpy(),
+                                 al_boot.squeeze(-1).cpu().numpy())
+        advantages, returns = compute_gae_batch(all_rew_buf, all_val_buf, all_done_buf, boot_vals)
+
+        # Split data by side
+        al_mask = all_is_axis_buf < 0.5  # (steps, envs) bool
+        ax_mask = ~al_mask
+
+        def extract_side(mask):
+            m = mask.reshape(-1)
+            return (
+                all_obs_buf.reshape(-1, obs_size)[m],
+                all_act_buf.reshape(-1, action_dim)[m],
+                all_logp_buf.reshape(-1)[m],
+                advantages.reshape(-1)[m],
+                returns.reshape(-1)[m],
             )
 
-        # Update Axis agent
-        axis_pg, axis_vl = 0.0, 0.0
-        if len(axis_data["obs"]) > 0:
-            adv, ret = compute_gae(axis_data["rewards"], list(axis_data["values"]),
-                                   axis_data["dones"])
-            axis_pg, axis_vl = ppo_update(
-                axis_model, axis_optimizer,
-                axis_data["obs"], axis_data["actions"], axis_data["logp"],
-                adv, ret, axis_log_std, device, batch_size=batch_size,
-            )
+        al_o, al_a, al_l, al_adv, al_ret = extract_side(al_mask)
+        ax_o, ax_a, ax_l, ax_adv, ax_ret = extract_side(ax_mask)
 
-        # Snapshot into league
-        if iteration > 0 and iteration % league_interval == 0:
-            allied_league.append(copy.deepcopy(allied_model.state_dict()))
-            axis_league.append(copy.deepcopy(axis_model.state_dict()))
-            print(f"  [League] Saved snapshot. Allied pool: {len(allied_league)}, Axis pool: {len(axis_league)}")
+        # === PPO Updates ===
+        def ppo_update(model, opt, log_std, obs, acts, old_lp, advs, rets, epochs_override=None, ent_coeff=0.02):
+            N = obs.shape[0]
+            if N == 0: return 0.0
+            n_epochs = epochs_override or num_epochs
+            o = torch.from_numpy(obs).to(device)
+            a = torch.from_numpy(acts).to(device)
+            ol = torch.from_numpy(old_lp).to(device)
+            ad = torch.from_numpy(advs).to(device)
+            ad = (ad - ad.mean()) / (ad.std() + 1e-8)
+            rt = torch.from_numpy(rets).to(device)
+
+            model.train()
+            loss_val = 0.0
+            for _ in range(n_epochs):
+                perm = torch.randperm(N, device=device)
+                for s in range(0, N, batch_size):
+                    idx = perm[s:s+batch_size]
+                    am, v = model.forward(o[idx])
+                    std = torch.exp(log_std).expand_as(am)
+                    lp = (-0.5 * ((a[idx] - am) / std)**2 - torch.log(std) - 0.9189).sum(-1)
+                    ent = (0.5 * torch.log(2*3.14159*2.71828 * std**2)).sum(-1).mean()
+                    ratio = torch.exp(lp - ol[idx])
+                    pg = -torch.min(ratio * ad[idx],
+                                   torch.clamp(ratio, 0.8, 1.2) * ad[idx]).mean()
+                    vl = nn.MSELoss()(v.squeeze(-1), rt[idx])
+                    loss = pg + 0.5*vl - ent_coeff*ent
+                    opt.zero_grad()
+                    loss.backward()
+                    # FIX #10: clip ALL params including log_std
+                    nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    opt.step()
+                    loss_val = pg.item()
+            return loss_val
+
+        al_pg = ppo_update(allied_model, allied_opt, allied_log_std,
+                           al_o, al_a, al_l, al_adv, al_ret)
+        # Axis gets 3x more PPO epochs + higher entropy for diverse strategies
+        ax_pg = ppo_update(axis_model, axis_opt, axis_log_std,
+                           ax_o, ax_a, ax_l, ax_adv, ax_ret,
+                           epochs_override=num_epochs * 5, ent_coeff=0.05)
+
+        # League snapshot — save Axis weights every 50 iterations
+        if iteration > 0 and iteration % 50 == 0:
+            league.append(copy.deepcopy(axis_model.state_dict()))
+            log(f"  [League] Saved Axis snapshot #{len(league)} (iter {iteration})")
+
+            # Activate league once we have 2+ snapshots
+            if len(league) >= 2 and not use_league:
+                use_league = True
+                log(f"  [League] ACTIVATED — Allied now faces diverse opponents")
+                log(f"  [League] Mix: 50% current Axis, 30% past snapshots, 20% random")
+
+            # Load a random league snapshot into the league_model
+            if len(league) >= 2:
+                random_snapshot = league[np.random.randint(0, len(league))]
+                league_model.load_state_dict(random_snapshot)
+                league_model.eval()
 
         # Logging
         if iteration % 5 == 0:
             elapsed = time.time() - start_time
             sps = total_steps / max(elapsed, 1)
-            remaining = (total_iterations - iteration) / max(iteration, 1) * elapsed
-            eta = f"{remaining/60:.1f}m" if remaining < 3600 else f"{remaining/3600:.1f}h"
+            rem = (total_iterations - iteration) / max(iteration, 1) * elapsed
+            eta = f"{rem/60:.1f}m" if rem < 3600 else f"{rem/3600:.1f}h"
+            wr = allied_wins / max(total_games, 1)
 
-            win_rate = allied_wins / max(total_games, 1)
-            recent_games = len(results)
+            # Timing breakdown
+            t_total_iter = t_gpu + t_rust + t_numpy
+            gpu_pct = t_gpu / max(t_total_iter, 1e-6) * 100
+            rust_pct = t_rust / max(t_total_iter, 1e-6) * 100
+            np_pct = t_numpy / max(t_total_iter, 1e-6) * 100
 
-            print(f"Iter {iteration:4d}/{total_iterations} | {total_steps:>9,} steps | "
-                  f"{sps:>6,.0f} sps | ETA: {eta:>6s} | "
-                  f"Games: {total_games} | Allied Win: {win_rate:.0%} | "
-                  f"A_PG: {allied_pg:.4f} | X_PG: {axis_pg:.4f}")
+            log(f"I{iteration:4d}/{total_iterations} | {total_steps:>10,} steps | "
+                f"{sps:>8,.0f} sps | ETA: {eta:>6s} | "
+                f"Games: {total_games:>5d} | Allied: {wr:.0%} | "
+                f"A_pg: {al_pg:.4f} X_pg: {ax_pg:.4f}")
+            log(f"  Timing: GPU {gpu_pct:.0f}% ({t_gpu:.2f}s) | "
+                f"Rust {rust_pct:.0f}% ({t_rust:.2f}s) | "
+                f"NumPy {np_pct:.0f}% ({t_numpy:.2f}s)")
 
-        # Save periodically
-        if iteration % 50 == 0 and iteration > 0:
+            log_timing({
+                "iteration": iteration, "total_steps": total_steps,
+                "sps": round(sps), "games": total_games,
+                "allied_win_rate": round(wr, 3),
+                "gpu_sec": round(t_gpu, 3), "rust_sec": round(t_rust, 3),
+                "numpy_sec": round(t_numpy, 3),
+                "gpu_pct": round(gpu_pct, 1), "rust_pct": round(rust_pct, 1),
+                "league_size": len(league), "league_active": use_league,
+            })
+
+        # Save full resumable checkpoint
+        if iteration % 100 == 0 and iteration > 0:
             torch.save({
-                "allied_model": allied_model.state_dict(),
-                "axis_model": axis_model.state_dict(),
-                "allied_log_std": allied_log_std.data,
-                "axis_log_std": axis_log_std.data,
+                "allied": allied_model.state_dict(),
+                "axis": axis_model.state_dict(),
+                "allied_opt": allied_opt.state_dict(),
+                "axis_opt": axis_opt.state_dict(),
                 "iteration": iteration,
-                "total_steps": total_steps,
                 "allied_wins": allied_wins,
                 "axis_wins": axis_wins,
-            }, save_path / f"selfplay_iter_{iteration}.pt")
+                "total_games": total_games,
+                "total_steps": total_steps,
+                "league": [s for s in league],  # all Axis snapshots
+            }, save_path / f"selfplay_{iteration}.pt")
+            log(f"  [Checkpoint] Saved iter {iteration} (resumable)")
 
-    # Final save
+    # Final
     torch.save({
-        "allied_model": allied_model.state_dict(),
-        "axis_model": axis_model.state_dict(),
-        "allied_log_std": allied_log_std.data,
-        "axis_log_std": axis_log_std.data,
+        "allied": allied_model.state_dict(),
+        "axis": axis_model.state_dict(),
+        "allied_opt": allied_opt.state_dict(),
+        "axis_opt": axis_opt.state_dict(),
         "iteration": total_iterations,
-        "total_steps": total_steps,
         "allied_wins": allied_wins,
         "axis_wins": axis_wins,
-        "allied_league": list(allied_league),
-        "axis_league": list(axis_league),
+        "total_games": total_games,
+        "total_steps": total_steps,
+        "league": [s for s in league],
     }, save_path / "selfplay_final.pt")
 
-    total_time = time.time() - start_time
-    print(f"\nSelf-play complete!")
-    print(f"  {total_steps:,} steps in {total_time:.0f}s ({total_steps/total_time:,.0f} sps)")
-    print(f"  {total_games} games: Allied {allied_wins} wins, Axis {axis_wins} wins")
-    print(f"  Allied win rate: {allied_wins/max(total_games,1):.0%}")
-    print(f"  Models saved to {save_path}")
+    t = time.time() - start_time
+    print(f"\nDone! {total_steps:,} steps in {t:.0f}s ({total_steps/t:,.0f} sps)")
+    print(f"Games: {total_games} | Allied {allied_wins} ({allied_wins/max(total_games,1):.0%})")
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-envs", type=int, default=32)
-    parser.add_argument("--iterations", type=int, default=200)
-    parser.add_argument("--num-steps", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--save-dir", type=str, default="checkpoints_selfplay")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument("--num-envs", type=int, default=128)
+    p.add_argument("--iterations", type=int, default=500)
+    p.add_argument("--steps-per-iter", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=1024)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--save-dir", type=str, default="checkpoints_selfplay_v3")
+    a = p.parse_args()
 
     print("=" * 70)
-    print("  RL TripleA — Self-Play Training")
-    print("  Both Allied and Axis agents learn simultaneously")
-    print(f"  Envs: {args.num_envs} | Iterations: {args.iterations}")
-    print("  Rust engine: ~40,000 game steps/sec")
+    print("  RL TripleA — Self-Play V3 (Rayon Parallel + MPS GPU)")
+    print(f"  {a.num_envs} envs on 16 CPU cores (Rayon) + MPS GPU neural net")
+    print(f"  Full mechanics: naval, AA, subs, BBs, bombing, capitals")
     print("=" * 70)
 
     train_selfplay(
-        num_envs=args.num_envs,
-        total_iterations=args.iterations,
-        num_steps=args.num_steps,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        save_dir=args.save_dir,
+        num_envs=a.num_envs,
+        total_iterations=a.iterations,
+        steps_per_iter=a.steps_per_iter,
+        batch_size=a.batch_size,
+        lr=a.lr,
+        save_dir=a.save_dir,
     )
