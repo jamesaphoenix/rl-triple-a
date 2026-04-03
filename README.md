@@ -48,10 +48,66 @@ python train_selfplay.py --num-envs 128 --iterations 500
 python train_phase2.py --iterations 2000
 ```
 
-### Play
+### Play Against the AI (Multiplayer Bot)
+
+The RL bot runs as a local HTTP server. TripleA's `RLBot` Java class sends game
+state each phase and the server returns purchase/move/place orders using the
+trained neural net.
 
 ```bash
-# Launch the HUD
+# 1. Start the action server (Allied model by default)
+conda activate rl-triplea
+python bot/action_server.py
+
+# Or play as Axis:
+RL_SIDE=axis python bot/action_server.py
+
+# Or use a specific checkpoint:
+RL_MODEL_PATH=checkpoints_phase2/selfplay_1800.pt python bot/action_server.py
+```
+
+The server listens on `http://localhost:8080`. Verify it's running:
+
+```bash
+curl http://localhost:8080/health
+# {"status":"ok","model_loaded":true,"model_path":"...","side":"allied"}
+```
+
+**In TripleA:**
+1. Host a new game on the **WW2v3 1942** map
+2. Assign one side to **RLBot** (the AI)
+3. Your opponent (e.g. your father) joins the hosted game
+4. Play — the bot makes decisions via the action server each phase
+
+### Run from a different machine (e.g. laptop → Mac Studio)
+
+If the action server runs on your Mac Studio and you play TripleA on your laptop:
+
+```bash
+# On Mac Studio — bind to all interfaces so your laptop can reach it
+conda activate rl-triplea
+python -c "
+import uvicorn
+from bot.action_server import app
+uvicorn.run(app, host='0.0.0.0', port=8080)
+"
+
+# On laptop — update RLBot.java's ACTION_SERVER_URL to point to Mac Studio:
+#   private static final String ACTION_SERVER_URL = "http://Jamess-Mac-Studio.local:8080/api/action";
+# Then rebuild TripleA with the updated RLBot.
+```
+
+### Run the Integration Tests
+
+```bash
+conda activate rl-triplea
+python tests/test_bot_integration.py
+# 43 tests: heuristic policy, model inference, API endpoints, multi-round stress
+```
+
+### Launch the HUD (recommendation mode — no bot, just suggestions)
+
+```bash
 ./play.sh
 
 # Open http://localhost:8080 in your browser
@@ -61,39 +117,41 @@ python train_phase2.py --iterations 2000
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│  TripleA Game (you vs opponent)              │
-│  Auto-saves to ~/triplea/savedGames/autoSave │
-└──────────────┬──────────────────────────────┘
-               │ .tsvg files
-               ▼
-┌──────────────────────────────┐
-│  Java Extractor              │
-│  Deserializes .tsvg → JSON   │
-│  (tools/SaveToJson.java)     │
-└──────────────┬───────────────┘
-               │ JSON game state
-               ▼
-┌──────────────────────────────┐
-│  Rust Engine (PyO3)          │
-│  Loads state → observation   │
-│  (rust_engine/src/lib.rs)    │
-└──────────────┬───────────────┘
-               │ 16,215-dim observation
-               ▼
-┌──────────────────────────────┐
-│  Neural Network (PyTorch)    │
-│  ActorCritic, 8.9M params    │
-│  (src/network.py)            │
-└──────────────┬───────────────┘
-               │ 337-dim action
-               ▼
-┌──────────────────────────────┐
-│  Web HUD (localhost:8080)    │
-│  Exact purchase/move/place   │
-│  orders per phase            │
-│  (hud/index.html)            │
-└──────────────────────────────┘
+                        ┌───────────────────────────────────────┐
+                        │  TripleA Game (WW2v3 1942)            │
+                        │  You + friend vs AI  (or HUD mode)    │
+                        └───────┬───────────────┬───────────────┘
+                    (Bot mode)  │               │  (HUD mode)
+                   RLBot.java   │               │  .tsvg auto-saves
+                                │               │
+               ┌────────────────▼──┐   ┌────────▼──────────────┐
+               │  Action Server    │   │  Java Extractor       │
+               │  POST /api/action │   │  .tsvg → JSON         │
+               │  (bot/)           │   │  (tools/)             │
+               └────────┬─────────┘   └────────┬──────────────┘
+                        │                       │
+                        ▼                       ▼
+               ┌──────────────────────────────────────┐
+               │  Rust Engine (PyO3)                   │
+               │  Game state → 16,701-dim observation  │
+               │  (rust_engine/src/lib.rs)             │
+               └────────────────┬─────────────────────┘
+                                │
+                                ▼
+               ┌──────────────────────────────────────┐
+               │  Neural Network (PyTorch)             │
+               │  ActorCriticV3 — GNN + Attention      │
+               │  337-dim action (purchase/attack/reinforce) │
+               │  (src/network.py)                     │
+               └────────────────┬─────────────────────┘
+                                │
+                ┌───────────────┼───────────────┐
+                ▼                               ▼
+  ┌──────────────────────┐        ┌──────────────────────┐
+  │  Bot: JSON response  │        │  HUD: Web UI         │
+  │  → RLBot.java        │        │  localhost:8080       │
+  │  executes moves      │        │  (hud/index.html)    │
+  └──────────────────────┘        └──────────────────────┘
 ```
 
 ## Project Structure
@@ -102,8 +160,11 @@ python train_phase2.py --iterations 2000
 rl-triple-a/
 ├── rust_engine/           # Rust game engine (WW2v3 1942 rules)
 │   └── src/lib.rs         #   Full rules: combat, naval, AA, subs, BBs, NOs, Chinese
+├── bot/
+│   ├── action_server.py   #   FastAPI server — real model inference for RLBot
+│   └── RLBot.java         #   TripleA AI player class (calls action server)
 ├── src/
-│   ├── network.py         #   ActorCriticV2 (MLP, 8.9M params)
+│   ├── network.py         #   ActorCriticV2 (MLP) + ActorCriticV3 (GNN)
 │   ├── map_parser.py      #   Parse WW2v3 XML map definition
 │   ├── game_data_export.py #  Export map data as numpy arrays for Rust
 │   └── units.py           #   Unit type definitions
@@ -114,7 +175,8 @@ rl-triple-a/
 │   ├── SaveToJson.java    #   Java bridge: .tsvg → JSON
 │   └── extract_live.sh    #   Shell wrapper for extraction
 ├── tests/
-│   └── test_live_extraction.py  # Integration tests
+│   ├── test_live_extraction.py  # Live extraction pipeline tests
+│   └── test_bot_integration.py  # Bot action server tests (43 tests)
 ├── experiments/
 │   ├── program.md         #   Auto-research program definition
 │   ├── prompt.md          #   Per-iteration research instructions
@@ -151,9 +213,9 @@ The Rust engine implements WW2v3 1942 rules verified against TripleA's Java sour
 | Training mode | Self-play + league (40% current / 40% past / 20% random) |
 | Games trained | 2.7 million |
 | Parallel environments | 128 (Rayon) |
-| Observation | 16,215 dims |
+| Observation | 16,701 dims |
 | Action | 337 dims (13 purchase + 162 attack + 162 reinforce) |
-| Network | 8.9M params, 3-layer MLP with LayerNorm |
+| Network | ActorCriticV3 — GNN + Attention (~118K params) |
 | Game engine speed | ~5,000 steps/sec |
 | Axis bid (training) | +60 PUs (stress test) |
 
