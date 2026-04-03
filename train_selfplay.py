@@ -215,7 +215,7 @@ def train_selfplay(
     current_obs = all_obs_flat.reshape(num_envs, obs_size)
 
     # === PPO update function (runs in background thread) ===
-    def ppo_update(model, opt, log_std, obs, acts, old_lp, advs, rets, epochs_override=None, ent_coeff=0.02):
+    def ppo_update(model, opt, log_std, obs, acts, old_lp, advs, rets, masks=None, epochs_override=None, ent_coeff=0.02):
         N = obs.shape[0]
         if N == 0: return 0.0
         n_epochs = epochs_override or num_epochs
@@ -225,6 +225,7 @@ def train_selfplay(
         ad = torch.from_numpy(advs).to(device)
         ad = (ad - ad.mean()) / (ad.std() + 1e-8)
         rt = torch.from_numpy(rets).to(device)
+        m = torch.from_numpy(masks).to(device) if masks is not None else None
 
         model.train()
         loss_val = 0.0
@@ -234,7 +235,12 @@ def train_selfplay(
                 idx = perm[s:s+batch_size]
                 am, v = model.forward(o[idx])
                 std = torch.exp(log_std).expand_as(am)
-                lp = (-0.5 * ((a[idx] - am) / std)**2 - torch.log(std) - 0.9189).sum(-1)
+                lp_per_dim = -0.5 * ((a[idx] - am) / std)**2 - torch.log(std) - 0.9189
+                # Action masking: only sum log-probs over legal dimensions
+                if m is not None:
+                    lp = (lp_per_dim * m[idx]).sum(-1)
+                else:
+                    lp = lp_per_dim.sum(-1)
                 ent = (0.5 * torch.log(2*3.14159*2.71828 * std**2)).sum(-1).mean()
                 ratio = torch.exp(lp - ol[idx])
                 pg = -torch.min(ratio * ad[idx],
@@ -264,6 +270,7 @@ def train_selfplay(
         # Rollout storage (fresh each iteration — safe for concurrent PPO)
         all_obs_buf = np.zeros((steps_per_iter, num_envs, obs_size), dtype=np.float32)
         all_act_buf = np.zeros((steps_per_iter, num_envs, action_dim), dtype=np.float32)
+        all_mask_buf = np.zeros((steps_per_iter, num_envs, action_dim), dtype=np.float32)
         all_logp_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
         all_val_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
         all_rew_buf = np.zeros((steps_per_iter, num_envs), dtype=np.float32)
@@ -281,6 +288,11 @@ def train_selfplay(
             is_axis_flags = np.array(batch_eng.get_is_axis())
             axis_mask = is_axis_flags.astype(bool)
 
+            # Fetch action masks from engine (1=legal, 0=illegal)
+            action_masks_flat = np.array(batch_eng.get_action_masks(), dtype=np.float32)
+            action_masks_np = action_masks_flat.reshape(num_envs, action_dim)
+            action_mask_tensor = torch.from_numpy(action_masks_np).to(device)
+
             obs_tensor = torch.from_numpy(current_obs).to(device)
 
             t1 = time.time()
@@ -290,22 +302,22 @@ def train_selfplay(
                 al_mean, al_val = allied_model.forward(obs_tensor)
                 al_std = torch.exp(allied_log_std).expand_as(al_mean)
                 al_dist = torch.distributions.Normal(al_mean, al_std)
-                al_actions = al_dist.sample().clamp(0.0, 1.0)
-                al_logp = al_dist.log_prob(al_actions).sum(-1)
+                al_actions = al_dist.sample().clamp(0.0, 1.0) * action_mask_tensor
+                al_logp = (al_dist.log_prob(al_actions) * action_mask_tensor).sum(-1)
 
                 # Axis: current model for all (used for training gradients)
                 ax_mean, ax_val = axis_model.forward(obs_tensor)
                 ax_std = torch.exp(axis_log_std).expand_as(ax_mean)
                 ax_dist = torch.distributions.Normal(ax_mean, ax_std)
-                ax_actions = ax_dist.sample().clamp(0.0, 1.0)
-                ax_logp = ax_dist.log_prob(ax_actions).sum(-1)
+                ax_actions = ax_dist.sample().clamp(0.0, 1.0) * action_mask_tensor
+                ax_logp = (ax_dist.log_prob(ax_actions) * action_mask_tensor).sum(-1)
 
                 # LEAGUE: override some Axis envs with league opponents
                 if use_league and len(league) >= 2:
                     league_ax_mean, _ = league_model.forward(obs_tensor)
                     league_ax_std = torch.exp(league_model.log_std).expand_as(league_ax_mean)
                     league_ax_dist = torch.distributions.Normal(league_ax_mean, league_ax_std)
-                    league_ax_actions = league_ax_dist.sample().clamp(0.0, 1.0)
+                    league_ax_actions = league_ax_dist.sample().clamp(0.0, 1.0) * action_mask_tensor
 
                     # Vectorized opponent assignment (no Python loop)
                     # 40% current Axis, 40% league, 20% random
@@ -313,7 +325,7 @@ def train_selfplay(
                     axis_mask_t = torch.from_numpy(axis_mask).to(device)
                     use_league_mask = axis_mask_t & (rand_vals >= 0.40) & (rand_vals < 0.80)
                     use_random_mask = axis_mask_t & (rand_vals >= 0.80)
-                    random_actions = torch.rand_like(ax_actions)
+                    random_actions = torch.rand_like(ax_actions) * action_mask_tensor
                     ax_actions[use_league_mask] = league_ax_actions[use_league_mask]
                     ax_actions[use_random_mask] = random_actions[use_random_mask]
 
@@ -359,6 +371,7 @@ def train_selfplay(
             # Store
             all_obs_buf[step] = current_obs
             all_act_buf[step] = actions_np
+            all_mask_buf[step] = action_masks_np
             all_logp_buf[step] = logp_np
             all_val_buf[step] = val_np
             all_rew_buf[step] = rewards
@@ -462,10 +475,11 @@ def train_selfplay(
                 all_logp_buf.reshape(-1)[m],
                 advantages.reshape(-1)[m],
                 returns.reshape(-1)[m],
+                all_mask_buf.reshape(-1, action_dim)[m],
             )
 
-        al_o, al_a, al_l, al_adv, al_ret = extract_side(al_mask)
-        ax_o, ax_a, ax_l, ax_adv, ax_ret = extract_side(ax_mask_buf)
+        al_o, al_a, al_l, al_adv, al_ret, al_m = extract_side(al_mask)
+        ax_o, ax_a, ax_l, ax_adv, ax_ret, ax_m = extract_side(ax_mask_buf)
 
         # === START PPO IN BACKGROUND THREAD ===
         # Next iteration's rollout (Rust CPU work) overlaps with this PPO (GPU work)
@@ -474,9 +488,9 @@ def train_selfplay(
 
         def run_ppo():
             ppo_result[0] = ppo_update(allied_model, allied_opt, allied_log_std,
-                                       al_o, al_a, al_l, al_adv, al_ret)
+                                       al_o, al_a, al_l, al_adv, al_ret, masks=al_m)
             ppo_result[1] = ppo_update(axis_model, axis_opt, axis_log_std,
-                                       ax_o, ax_a, ax_l, ax_adv, ax_ret,
+                                       ax_o, ax_a, ax_l, ax_adv, ax_ret, masks=ax_m,
                                        epochs_override=num_epochs * 5, ent_coeff=0.05)
 
         ppo_thread = threading.Thread(target=run_ppo, daemon=True)

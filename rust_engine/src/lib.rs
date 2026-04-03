@@ -141,6 +141,22 @@ impl TripleAEngine {
     }
 
     // FIX #12: check ANY enemy unit (including AA/factory) for blitz blocking
+    fn sea_zone_has_enemy_surface_warships(&self, t: usize, attacker_is_axis: bool) -> bool {
+        for ep in 0..NUM_PLAYERS {
+            if is_axis(ep) != attacker_is_axis {
+                // Surface warships: DD, CRU, CAR, BB (not SUB, not TRN)
+                if self.get_unit(t, ep, DD) > 0
+                    || self.get_unit(t, ep, CRU) > 0
+                    || self.get_unit(t, ep, CAR) > 0
+                    || self.get_unit(t, ep, BB) > 0
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn territory_has_any_enemy_unit(&self, t: usize, attacker_is_axis: bool) -> bool {
         for ep in 0..NUM_PLAYERS {
             if is_axis(ep) != attacker_is_axis {
@@ -424,6 +440,7 @@ impl TripleAEngine {
     }
 
     fn get_obs_size(&self) -> usize { self.obs_size }
+    fn get_action_dim(&self) -> usize { NUM_UNIT_TYPES + self.num_t * 2 }
     fn get_num_territories(&self) -> usize { self.num_t }
     fn get_current_player(&self) -> usize { self.current_player }
     fn is_done(&self) -> bool { self.done }
@@ -481,6 +498,75 @@ impl TripleAEngine {
         obs.push(self.round as f32 / 20.0);
         for p in 0..NUM_PLAYERS { obs.push(if self.current_player == p { 1.0 } else { 0.0 }); }
         obs
+    }
+
+    // ── Action Mask ──────────────────────────────────────────
+    // Returns a mask vector (same shape as action space):
+    //   [13 purchase slots | num_t attack slots | num_t reinforce slots]
+    // 1.0 = legal, 0.0 = illegal.
+
+    fn get_action_mask(&self) -> Vec<f32> {
+        let p = self.current_player;
+        let pa = is_axis(p);
+        let action_dim = NUM_UNIT_TYPES + self.num_t * 2;
+        let mut mask = vec![1.0f32; action_dim];
+
+        // Purchase mask: all unit types legal (budget checked at execution time)
+        // Exception: Chinese can't purchase
+        if p == CHINESE {
+            for u in 0..NUM_UNIT_TYPES {
+                mask[u] = 0.0;
+            }
+        }
+
+        // Attack mask (slots NUM_UNIT_TYPES .. NUM_UNIT_TYPES + num_t)
+        for t in 0..self.num_t {
+            let slot = NUM_UNIT_TYPES + t;
+            // Impassable: never attackable
+            if self.is_impassable[t] {
+                mask[slot] = 0.0;
+                continue;
+            }
+            // Chinese restriction
+            if p == CHINESE && !self.is_valid_chinese_move(0, t) {
+                mask[slot] = 0.0;
+                continue;
+            }
+            // Own non-water territory: can't attack yourself
+            let t_owner = self.owner[t];
+            if !self.is_water[t] && t_owner >= 0 && is_axis(t_owner as usize) == pa {
+                mask[slot] = 0.0;
+                continue;
+            }
+            // Sea zone with no enemy: nothing to attack
+            if self.is_water[t] && !self.territory_has_enemy_combat_units(t, pa) {
+                mask[slot] = 0.0;
+                continue;
+            }
+        }
+
+        // Reinforce mask (slots NUM_UNIT_TYPES + num_t .. NUM_UNIT_TYPES + 2*num_t)
+        for t in 0..self.num_t {
+            let slot = NUM_UNIT_TYPES + self.num_t + t;
+            // Impassable
+            if self.is_impassable[t] {
+                mask[slot] = 0.0;
+                continue;
+            }
+            // Chinese restriction
+            if p == CHINESE && !self.is_valid_chinese_move(0, t) {
+                mask[slot] = 0.0;
+                continue;
+            }
+            // Can only reinforce friendly or neutral territories (not enemy land)
+            if !self.is_water[t] && self.owner[t] >= 0
+                && is_axis(self.owner[t] as usize) != pa {
+                mask[slot] = 0.0;
+                continue;
+            }
+        }
+
+        mask
     }
 
     // ── Purchase ─────────────────────────────────────────────
@@ -591,6 +677,8 @@ impl TripleAEngine {
                             avail[u] = (c - keep).max(0);
                         } else if UNIT_IS_LAND[u] && self.is_water[n] {
                             // Land units from sea zones: ONLY via transport (amphibious)
+                            // FIX #28: can't load transports in sea zones with enemy surface warships
+                            if self.sea_zone_has_enemy_surface_warships(n, pa) { continue; }
                             let transports = self.get_unit(n, p, TRN);
                             if transports > 0 {
                                 let max_carry = transports * 2;
@@ -1760,11 +1848,25 @@ impl BatchEngine {
     }
 
     fn get_obs_size(&self) -> usize { self.obs_size }
+    fn get_action_dim(&self) -> usize { NUM_UNIT_TYPES + self.num_t * 2 }
     fn get_num_territories(&self) -> usize { self.num_t }
     fn get_num_envs(&self) -> usize { self.num_envs }
     fn get_is_axis<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
         let flags: Vec<bool> = self.engines.iter().map(|e| is_axis(e.current_player)).collect();
         PyArray1::from_vec(py, flags)
+    }
+
+    /// Return action masks for all envs as a flat array [num_envs * action_dim].
+    /// Reshape in Python to (num_envs, action_dim).
+    fn get_action_masks<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f32>> {
+        let action_dim = NUM_UNIT_TYPES + self.num_t * 2;
+        let n = self.num_envs;
+        let mut all_masks = vec![0.0f32; n * action_dim];
+        for (i, eng) in self.engines.iter().enumerate() {
+            let m = eng.get_action_mask();
+            all_masks[i * action_dim..(i + 1) * action_dim].copy_from_slice(&m);
+        }
+        PyArray1::from_vec(py, all_masks)
     }
 
     #[pyo3(signature = (player, value, territories, count, enemy_sea_zones, allied_exclusion, direct_ownership=None))]
